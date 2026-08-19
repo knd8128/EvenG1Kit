@@ -235,9 +235,12 @@ public final class EvenG1SDK: NSObject, ObservableObject {
     
     /// Gap between consecutive chunks of an image transfer. Fifty-one chunks
     /// make up one 576x136 frame, so this sets how long a frame takes to arrive.
-    private static let imageChunkInterval: TimeInterval = 0.005
-    /// Image transfers pace themselves; they must not do it on the caller's thread.
-    private let imageQueue = DispatchQueue(label: "network.rubio.eveng1.image")
+    /// Packets waiting for each arm's radio, keyed by peripheral.
+    private var outbox: [ObjectIdentifier: [Data]] = [:]
+    /// Called once every queued packet has been handed to the radio.
+    private var outboxDrained: (() -> Void)?
+    private var upkeepTimer: DispatchSourceTimer?
+    private var upkeepTicks = 0
 
     private func sendToBoth(_ data: Data?) {
         guard let data = data else { return }
@@ -291,45 +294,128 @@ public final class EvenG1SDK: NSObject, ObservableObject {
     
     /// Uploads a full-screen frame: every chunk, then the end marker, then the CRC.
     ///
-    /// The transfer paces itself, so it runs on its own queue rather than the
-    /// caller's. That is not tidiness. Each chunk goes to the left arm at once
-    /// and to the right arm 100 ms later, on the main queue; if the caller were
-    /// the main thread, its own sleeps would keep those fifty-one right-arm
-    /// writes from running at all, and they would land back to back the moment
-    /// the loop ended -- the exact burst the gap exists to prevent.
+    /// A frame is fifty-one packets per arm, and the radio cannot take them as
+    /// fast as a loop can hand them over. Core Bluetooth accepts an unresponded
+    /// write only while `canSendWriteWithoutResponse` is true and **silently
+    /// drops the rest** — no error, no delegate call, the image simply never
+    /// arrives. Pacing with sleeps, as this used to, is guessing at a number the
+    /// system will tell you exactly: the packets queue here and go out as the
+    /// radio reports it is ready.
     ///
-    /// `completion` runs on the main queue once the last packet is out, which is
-    /// what a caller needs to hold a frame for a while and then clear it.
+    /// `completion` runs once the last packet of both arms has been handed over.
     public func sendImage(raw: Data, completion: (() -> Void)? = nil) {
-        let chunks = EvenG1Protocol.Bmp.data(image: raw)
-        let crcValue = crc32xz(of: EvenG1Protocol.Bmp.calculateCrcInput(image: raw))
+        var packets = EvenG1Protocol.Bmp.data(image: raw)
+        packets.append(EvenG1Protocol.Bmp.endData())
+        packets.append(EvenG1Protocol.Bmp.crcData(
+            crcValue: crc32xz(of: EvenG1Protocol.Bmp.calculateCrcInput(image: raw))))
 
-        imageQueue.async { [weak self] in
+        DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            for chunk in chunks {
-                DispatchQueue.main.async { self.sendToBoth(chunk) }
-                Thread.sleep(forTimeInterval: Self.imageChunkInterval)
-            }
-            DispatchQueue.main.async {
-                self.sendToBoth(EvenG1Protocol.Bmp.endData())
-            }
-            Thread.sleep(forTimeInterval: Self.imageChunkInterval)
-            DispatchQueue.main.async {
-                self.sendToBoth(EvenG1Protocol.Bmp.crcData(crcValue: crcValue))
-            }
-            guard let completion = completion else { return }
-            // The right arm still trails the left by the gap sendToBoth leaves.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: completion)
+            self.outboxDrained = completion
+            self.enqueue(packets)
         }
     }
-    
+
+    // MARK: - Flow-controlled writes
+    //
+    // Only bulk transfers go through here. Single commands keep the old path:
+    // they are one packet and never fill the buffer.
+
+    private func writeChar(for peripheral: CBPeripheral) -> CBCharacteristic? {
+        peripheral == leftPeripheral ? leftWriteChar : rightWriteChar
+    }
+
+    /// Queues the same packets for both arms and starts them moving.
+    private func enqueue(_ packets: [Data]) {
+        for peripheral in [leftPeripheral, rightPeripheral] {
+            guard let peripheral = peripheral, writeChar(for: peripheral) != nil else { continue }
+            outbox[ObjectIdentifier(peripheral), default: []].append(contentsOf: packets)
+        }
+        for peripheral in [leftPeripheral, rightPeripheral] {
+            guard let peripheral = peripheral else { continue }
+            drain(peripheral)
+        }
+    }
+
+    private func drain(_ peripheral: CBPeripheral) {
+        guard let characteristic = writeChar(for: peripheral) else { return }
+        let key = ObjectIdentifier(peripheral)
+        while peripheral.canSendWriteWithoutResponse, let next = outbox[key]?.first {
+            outbox[key]?.removeFirst()
+            peripheral.writeValue(next, for: characteristic, type: .withoutResponse)
+        }
+        guard outbox.values.allSatisfy({ $0.isEmpty }), let done = outboxDrained else { return }
+        outboxDrained = nil
+        trace("Bulk transfer drained")
+        DispatchQueue.main.async(execute: done)
+    }
+
+    public func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+        drain(peripheral)
+    }
+
+    // MARK: - Upkeep
+    //
+    // The glasses do not push their own state. Without this the battery reading
+    // is whatever it was at connect: it was showing an hour-old figure, and a
+    // flat 0 on the left, because the query only ever went to the right arm.
+
+    /// Keepalive interval. Also the tick the other refreshes are counted in.
+    private static let upkeepInterval: TimeInterval = 8
+    /// Battery every twenty ticks; it does not move faster than that.
+    private static let batteryEveryTicks = 20
+
+    private func startUpkeep() {
+        stopUpkeep()
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + Self.upkeepInterval, repeating: Self.upkeepInterval)
+        timer.setEventHandler { [weak self] in self?.upkeepTick() }
+        upkeepTimer = timer
+        timer.resume()
+    }
+
+    private func stopUpkeep() {
+        upkeepTimer?.cancel()
+        upkeepTimer = nil
+        upkeepTicks = 0
+    }
+
+    private func upkeepTick() {
+        sendToBoth(EvenG1Protocol.heartbeatData())
+        upkeepTicks &+= 1
+        if upkeepTicks % Self.batteryEveryTicks == 0 { refreshBattery() }
+    }
+
+    /// Asks BOTH arms. Each one knows only its own charge, so querying one and
+    /// reading the answer as a pair leaves the other at zero forever.
+    public func refreshBattery() {
+        sendToBoth(EvenG1Protocol.batteryData())
+    }
+
+    /// Sets the glasses' clock, and the weather beside it.
+    ///
+    /// The dashboard has no clock of its own: unless the phone tells it the
+    /// time it will keep showing the start of its own epoch, which is what
+    /// "monday 01-01, 01:00 am" is.
+    public func syncTimeAndWeather(
+        icon: EvenG1Protocol.WeatherIcon = .none,
+        temperature: Int8 = 0,
+        isFahrenheit: Bool = false,
+        is12Hour: Bool = false
+    ) {
+        sendToBoth(EvenG1Protocol.dashTimeWeatherData(
+            weatherIcon: icon, temp: temperature,
+            isFahrenheit: isFahrenheit, is12Hour: is12Hour))
+    }
+
     public func refreshState() {
         // Staggered so the glasses are not flooded with back-to-back queries.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             self.sendToRight(EvenG1Protocol.getBrightnessData())
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
-            self.sendToRight(EvenG1Protocol.batteryData())
+            // Both: each arm reports only its own charge.
+            self.sendToBoth(EvenG1Protocol.batteryData())
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) {
             self.sendToRight(EvenG1Protocol.glassesStateData())
@@ -735,8 +821,12 @@ extension EvenG1SDK: CBCentralManagerDelegate, CBPeripheralDelegate {
         
         if !leftOk && !rightOk {
             state = .idle
+            stopUpkeep()
+            outbox.removeAll()
+            outboxDrained = nil
         } else {
             state = .connected(left: leftOk, right: rightOk)
+            if leftOk && rightOk { startUpkeep() }
         }
         delegate?.didChangeConnectionState(state)
     }
