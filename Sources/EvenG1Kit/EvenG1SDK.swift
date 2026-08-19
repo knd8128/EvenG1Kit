@@ -134,13 +134,13 @@ public final class EvenG1SDK: NSObject, ObservableObject {
         pairs.removeAll()
         peripheralsById.removeAll()
         
-        print("SDK: Starting Scan...")
+        trace("Starting Scan...")
         
         // 1. Retrieve already connected peripherals (System level)
         let connected = central.retrieveConnectedPeripherals(withServices: [serviceUUID])
-        print("SDK: Retrieved \(connected.count) connected peripherals")
+        trace("Retrieved \(connected.count) connected peripherals")
         for p in connected {
-            print("SDK: Found connected peripheral: \(p.name ?? "Unknown")")
+            trace("Found connected peripheral: \(p.name ?? "Unknown")")
             // Manually trigger discovery handling
             centralManager(central, didDiscover: p, advertisementData: [:], rssi: 0)
         }
@@ -156,7 +156,7 @@ public final class EvenG1SDK: NSObject, ObservableObject {
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.central.stopScan()
-                print("SDK: Scan Timeout. Results: \(self.scanResults.count), Pairs: \(self.pairs.count)")
+                trace("Scan Timeout. Results: \(self.scanResults.count), Pairs: \(self.pairs.count)")
                 if self.scanResults.isEmpty && self.pairs.isEmpty {
                     self.state = .idle
                     self.lastError = .scanTimeout
@@ -178,48 +178,48 @@ public final class EvenG1SDK: NSObject, ObservableObject {
     }
     
     public func connect(pair: Pair) {
-        print("SDK: connect(pair) called for channel: \(pair.channel ?? "nil")")
+        trace("connect(pair) called for channel: \(pair.channel ?? "nil")")
         connectBy(leftId: pair.left?.id, rightId: pair.right?.id)
     }
     
     public func connect() {
-        print("SDK: connect() called (Auto)")
+        trace("connect() called (Auto)")
         // Prefer complete pair
         if let complete = pairs.values.first(where: { $0.left != nil && $0.right != nil }) {
-            print("SDK: Found complete pair: \(complete.channel ?? "unknown")")
+            trace("Found complete pair: \(complete.channel ?? "unknown")")
             connect(pair: complete); return
         }
         // Else first available L/R
         let leftCand  = scanResults.first(where: { $0.side == .left })
         let rightCand = scanResults.first(where: { $0.side == .right })
         
-        print("SDK: Candidates - Left: \(leftCand?.name ?? "nil"), Right: \(rightCand?.name ?? "nil")")
+        trace("Candidates - Left: \(leftCand?.name ?? "nil"), Right: \(rightCand?.name ?? "nil")")
         
         if leftCand != nil || rightCand != nil {
             connectBy(leftId: leftCand?.id, rightId: rightCand?.id); return
         }
-        print("SDK: No candidates found for auto-connect")
+        trace("No candidates found for auto-connect")
         delegate?.didRequirePairSelection(Array(pairs.values))
     }
     
     public func connectBy(leftId: UUID?, rightId: UUID?) {
-        print("SDK: connectBy called. Left: \(String(describing: leftId)), Right: \(String(describing: rightId))")
+        trace("connectBy called. Left: \(String(describing: leftId)), Right: \(String(describing: rightId))")
         state = .connecting
         if let l = leftId, let p = peripheralsById[l] {
-            print("SDK: Connecting to Left Peripheral: \(p.name ?? "Unknown")")
+            trace("Connecting to Left Peripheral: \(p.name ?? "Unknown")")
             leftPeripheral = p
             p.delegate = self
             central.connect(p, options: [CBConnectPeripheralOptionNotifyOnDisconnectionKey: true])
         } else {
-            print("SDK: Left Peripheral ID not found or nil")
+            trace("Left Peripheral ID not found or nil")
         }
         if let r = rightId, let p = peripheralsById[r] {
-            print("SDK: Connecting to Right Peripheral: \(p.name ?? "Unknown")")
+            trace("Connecting to Right Peripheral: \(p.name ?? "Unknown")")
             rightPeripheral = p
             p.delegate = self
             central.connect(p, options: [CBConnectPeripheralOptionNotifyOnDisconnectionKey: true])
         } else {
-            print("SDK: Right Peripheral ID not found or nil")
+            trace("Right Peripheral ID not found or nil")
         }
         delegate?.didChangeConnectionState(state)
     }
@@ -239,7 +239,7 @@ public final class EvenG1SDK: NSObject, ObservableObject {
         if let l = leftPeripheral, let c = leftWriteChar {
             l.writeValue(data, for: c, type: .withoutResponse)
         } else {
-            print("SDK: Left Lens not ready (Peripheral: \(leftPeripheral != nil), Char: \(leftWriteChar != nil))")
+            trace("Left Lens not ready (Peripheral: \(leftPeripheral != nil), Char: \(leftWriteChar != nil))")
         }
         
         // The right arm needs the gap; back-to-back writes drop on its side.
@@ -248,7 +248,7 @@ public final class EvenG1SDK: NSObject, ObservableObject {
             if let r = self.rightPeripheral, let c = self.rightWriteChar {
                 r.writeValue(data, for: c, type: .withoutResponse)
             } else {
-                print("SDK: Right Lens not ready (Peripheral: \(self.rightPeripheral != nil), Char: \(self.rightWriteChar != nil))")
+                trace("Right Lens not ready (Peripheral: \(self.rightPeripheral != nil), Char: \(self.rightWriteChar != nil))")
             }
         }
     }
@@ -639,7 +639,7 @@ extension EvenG1SDK: CBCentralManagerDelegate, CBPeripheralDelegate {
         peripheralsById[p.identifier] = p
         let name = p.name ?? "Unknown"
         let (side, channel) = parseName(name)
-        print("SDK: Discovered \(name) -> Side: \(side), Channel: \(channel ?? "nil")")
+        trace("Discovered \(name) -> Side: \(side), Channel: \(channel ?? "nil")")
         let d = Discovered(id: p.identifier, name: name, rssi: RSSI.intValue, side: side, channel: channel)
         
         if let idx = scanResults.firstIndex(where: { $0.id == d.id }) {
@@ -662,14 +662,14 @@ extension EvenG1SDK: CBCentralManagerDelegate, CBPeripheralDelegate {
     }
     
     public func centralManager(_ central: CBCentralManager, didConnect p: CBPeripheral) {
-        print("SDK: Connected to \(p.name ?? "Unknown")")
+        trace("Connected to \(p.name ?? "Unknown")")
         p.delegate = self
         p.discoverServices([serviceUUID])
         checkConnectionState()
     }
     
     public func centralManager(_ central: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) {
-        print("SDK: Failed to connect to \(p.name ?? "Unknown"): \(error?.localizedDescription ?? "No error")")
+        trace("Failed to connect to \(p.name ?? "Unknown"): \(error?.localizedDescription ?? "No error")")
         lastError = .connectionFailed(name: p.name, id: p.identifier, underlying: error)
         delegate?.didFailToConnect(name: p.name, id: p.identifier, error: error)
         state = .error(lastError!)
@@ -677,7 +677,7 @@ extension EvenG1SDK: CBCentralManagerDelegate, CBPeripheralDelegate {
     }
     
     public func centralManager(_ central: CBCentralManager, didDisconnectPeripheral p: CBPeripheral, error: Error?) {
-        print("SDK: Disconnected from \(p.name ?? "Unknown")")
+        trace("Disconnected from \(p.name ?? "Unknown")")
         delegate?.didLosePeripheral(name: p.name, id: p.identifier)
         
         if p == leftPeripheral { leftPeripheral = nil; leftWriteChar = nil; leftNotifyChar = nil }
@@ -697,7 +697,7 @@ extension EvenG1SDK: CBCentralManagerDelegate, CBPeripheralDelegate {
     private func checkConnectionState() {
         let leftOk = (leftPeripheral?.state == .connected)
         let rightOk = (rightPeripheral?.state == .connected)
-        print("SDK: Connection State Check - Left: \(leftOk), Right: \(rightOk)")
+        trace("Connection State Check - Left: \(leftOk), Right: \(rightOk)")
         
         if !leftOk && !rightOk {
             state = .idle
@@ -708,30 +708,30 @@ extension EvenG1SDK: CBCentralManagerDelegate, CBPeripheralDelegate {
     }
     
     public func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) {
-        print("SDK: Discovered Services for \(p.name ?? "Unknown")")
+        trace("Discovered Services for \(p.name ?? "Unknown")")
         p.services?.forEach { p.discoverCharacteristics([charWriteUUID, charNotifyUUID], for: $0) }
     }
     
     public func peripheral(_ p: CBPeripheral, didDiscoverCharacteristicsFor s: CBService, error: Error?) {
-        print("SDK: Discovered Characteristics for \(p.name ?? "Unknown")")
+        trace("Discovered Characteristics for \(p.name ?? "Unknown")")
         s.characteristics?.forEach { ch in
             if ch.uuid == charWriteUUID {
                 if p == leftPeripheral {
-                    print("SDK: Found Left Write Char")
+                    trace("Found Left Write Char")
                     leftWriteChar = ch
                 }
                 if p == rightPeripheral {
-                    print("SDK: Found Right Write Char")
+                    trace("Found Right Write Char")
                     rightWriteChar = ch
                 }
             } else if ch.uuid == charNotifyUUID {
                 p.setNotifyValue(true, for: ch)
                 if p == leftPeripheral {
-                    print("SDK: Found Left Notify Char")
+                    trace("Found Left Notify Char")
                     leftNotifyChar = ch
                 }
                 if p == rightPeripheral {
-                    print("SDK: Found Right Notify Char")
+                    trace("Found Right Notify Char")
                     rightNotifyChar = ch
                 }
             }
@@ -757,7 +757,7 @@ extension EvenG1SDK: CBCentralManagerDelegate, CBPeripheralDelegate {
             cmdName = "\(cmd)"
         }
         
-        print("SDK Log: \(prefix) [\(cmdName)] Data: \(hex)")
+        trace("\(prefix) [\(cmdName)] Data: \(hex)")
     }
 }
 
@@ -771,4 +771,16 @@ extension EvenG1SDK {
         let side: SideHint = (sideStr == "L") ? .left : (sideStr == "R" ? .right : .unknown)
         return (side, channel)
     }
+}
+
+/// Verbose BLE tracing. Off by default so the SDK stays quiet in a host app;
+/// set `EvenG1SDK.isTracingEnabled = true` while debugging a connection.
+public extension EvenG1SDK {
+    static var isTracingEnabled = false
+}
+
+@inline(__always)
+func trace(_ message: @autoclosure () -> String) {
+    guard EvenG1SDK.isTracingEnabled else { return }
+    print("[EvenG1Kit] \(message())")
 }

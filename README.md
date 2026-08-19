@@ -68,6 +68,15 @@ func didReceiveTouchEvent(side: String, type: String) {
 The full opcode table, packet layouts, and the connection handshake are documented in
 [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
+## Debugging
+
+The SDK is silent by default. To trace discovery, connection and every packet in and
+out:
+
+```swift
+EvenG1SDK.isTracingEnabled = true
+```
+
 ## Caveats
 
 - `sendText` writes a single page. Longer copy is truncated by the firmware — paginate
