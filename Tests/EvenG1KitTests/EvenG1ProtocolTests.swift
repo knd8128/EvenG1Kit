@@ -40,10 +40,11 @@ final class EvenG1ProtocolTests: XCTestCase {
         let image = Data(repeating: 0xAB, count: 500)
         let chunks = EvenG1Protocol.Bmp.data(image: image)
 
-        XCTAssertEqual(chunks.count, 3) // 194 + 194 + 112
+        XCTAssertEqual(chunks.count, 3) // 174 + 174 + 152
         XCTAssertEqual(Array(chunks[0].prefix(6)), [0x15, 0x00, 0x00, 0x1C, 0x00, 0x00])
         XCTAssertEqual(Array(chunks[1].prefix(2)), [0x15, 0x01])
-        XCTAssertEqual(chunks[1].count, 196)
+        // Sizes are asserted against the firmware's packet limit, not a
+        // literal, in testNoImagePacketExceedsWhatTheFirmwareTakes.
 
         let payload = chunks.enumerated().map { $0.offset == 0 ? $0.element.dropFirst(6) : $0.element.dropFirst(2) }
         XCTAssertEqual(Data(payload.joined()), image)
@@ -101,5 +102,31 @@ final class EvenG1ProtocolTests: XCTestCase {
 
     func testHeartbeat() {
         XCTAssertEqual(Array(EvenG1Protocol.heartbeatData()), [0x25, 0x06, 0x00, 0x00, 0x04])
+    }
+}
+
+
+extension EvenG1ProtocolTests {
+    func testNoImagePacketExceedsWhatTheFirmwareTakes() {
+        // 180 bytes per packet, and the first chunk also carries four address
+        // bytes. Going over is silent: the packet simply never lands.
+        let frame = Data(repeating: 0xA5, count: 576 * 136 / 8)
+        let packets = EvenG1Protocol.Bmp.data(image: frame)
+        for (index, packet) in packets.enumerated() {
+            XCTAssertLessThanOrEqual(
+                packet.count, 180,
+                "chunk \(index) is \(packet.count) bytes, over the packet limit")
+        }
+    }
+
+    func testEveryByteOfTheFrameIsSentExactlyOnce() {
+        let frame = Data((0..<(576 * 136 / 8)).map { UInt8($0 % 251) })
+        let packets = EvenG1Protocol.Bmp.data(image: frame)
+        var rebuilt = Data()
+        for (index, packet) in packets.enumerated() {
+            // 0x15, seq, then four address bytes on the first chunk only.
+            rebuilt.append(packet.dropFirst(index == 0 ? 6 : 2))
+        }
+        XCTAssertEqual(rebuilt, frame)
     }
 }

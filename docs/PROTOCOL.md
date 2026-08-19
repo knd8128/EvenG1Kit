@@ -135,8 +135,11 @@ screen, up to 255 pages.
 
 The panel is **576 × 136**, 1 bit per pixel.
 
-1. Split the buffer into 194-byte chunks. The first carries a 4-byte address header:
+1. Split the buffer into 174-byte chunks. The first carries a 4-byte address header:
    `[0x15, seq, 0x00, 0x1C, 0x00, 0x00] + data`; the rest are `[0x15, seq] + data`.
+   The size is set by the 180-byte packet limit above, minus the six bytes the first
+   chunk spends on its opcode, sequence and address — 194, which several published
+   implementations use, puts that first packet at 200 bytes.
 2. Send the end marker `[0x20, 0x0D, 0x0E]`.
 3. Send `[0x16] + crc32`, big-endian, where the CRC-32/XZ covers the address bytes
    followed by the raw image data.

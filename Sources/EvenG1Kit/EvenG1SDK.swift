@@ -240,8 +240,8 @@ public final class EvenG1SDK: NSObject, ObservableObject {
     
     /// Gap between consecutive chunks of an image transfer. Fifty-one chunks
     /// make up one 576x136 frame, so this sets how long a frame takes to arrive.
-    /// Signalled when the glasses acknowledge the chunk in flight.
-    private var imageAck: (() -> Void)?
+    /// Called with the verdict when the glasses answer the chunk in flight.
+    private var imageAck: ((Bool) -> Void)?
     /// Image transfers pace themselves; not on the caller's thread.
     private let imageQueue = DispatchQueue(label: "network.rubio.eveng1.image")
     private var upkeepTimer: DispatchSourceTimer?
@@ -297,17 +297,35 @@ public final class EvenG1SDK: NSObject, ObservableObject {
     }
     #endif
     
+    /// What a transfer actually did, since the display cannot be looked at
+    /// from here and an image that never draws looks the same as one that
+    /// never arrived.
+    public struct ImageTransferReport: Sendable {
+        public let packets: Int
+        public let acknowledged: Int
+        public let rejected: Int
+        public let unanswered: Int
+
+        public var summary: String {
+            "\(acknowledged)/\(packets) confirmados"
+                + (rejected > 0 ? ", \(rejected) rechazados" : "")
+                + (unanswered > 0 ? ", \(unanswered) sin respuesta" : "")
+        }
+    }
+
     /// Uploads a full-screen frame: every chunk, then the end marker, then the CRC.
     ///
     /// The glasses acknowledge each chunk before the next one should be sent —
     /// the same `0xC9` handshake the notification protocol documents. Without
     /// it the firmware's receive buffer is overrun no matter how politely the
     /// radio is fed, and it starts reading the middle of the stream as
-    /// commands: sending a frame this way put the glasses into Even AI's
+    /// commands: sending a frame that way put the glasses into Even AI's
     /// listening screen instead of drawing anything.
     ///
     /// One arm at a time, because each keeps its own transfer state.
-    public func sendImage(raw: Data, completion: (() -> Void)? = nil) {
+    public func sendImage(
+        raw: Data, completion: ((ImageTransferReport) -> Void)? = nil
+    ) {
         var packets = EvenG1Protocol.Bmp.data(image: raw)
         packets.append(EvenG1Protocol.Bmp.endData())
         packets.append(EvenG1Protocol.Bmp.crcData(
@@ -315,18 +333,27 @@ public final class EvenG1SDK: NSObject, ObservableObject {
 
         imageQueue.async { [weak self] in
             guard let self = self else { return }
+            var acknowledged = 0, rejected = 0, unanswered = 0
             for side in [Side.left, Side.right] {
                 for packet in packets {
-                    self.sendAwaitingAck(packet, to: side)
+                    switch self.sendAwaitingAck(packet, to: side) {
+                    case .acknowledged: acknowledged += 1
+                    case .rejected:     rejected += 1
+                    case .unanswered:   unanswered += 1
+                    }
                 }
             }
-            trace("Image transfer finished")
+            let report = ImageTransferReport(
+                packets: packets.count * 2, acknowledged: acknowledged,
+                rejected: rejected, unanswered: unanswered)
+            trace("Image transfer: \(report.summary)")
             guard let completion = completion else { return }
-            DispatchQueue.main.async(execute: completion)
+            DispatchQueue.main.async { completion(report) }
         }
     }
 
     enum Side { case left, right }
+    enum AckResult { case acknowledged, rejected, unanswered }
 
     /// Writes one packet and waits for the glasses to say they took it.
     ///
@@ -335,8 +362,9 @@ public final class EvenG1SDK: NSObject, ObservableObject {
     /// instead of by the glasses.
     private static let ackTimeout: TimeInterval = 0.06
 
-    private func sendAwaitingAck(_ data: Data, to side: Side) {
+    private func sendAwaitingAck(_ data: Data, to side: Side) -> AckResult {
         let semaphore = DispatchSemaphore(value: 0)
+        let outcome = Locked<AckResult>(.unanswered)
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { semaphore.signal(); return }
             let peripheral = side == .left ? self.leftPeripheral : self.rightPeripheral
@@ -345,11 +373,15 @@ public final class EvenG1SDK: NSObject, ObservableObject {
                 semaphore.signal()
                 return
             }
-            self.imageAck = { semaphore.signal() }
+            self.imageAck = { ok in
+                outcome.value = ok ? .acknowledged : .rejected
+                semaphore.signal()
+            }
             peripheral.writeValue(data, for: characteristic, type: .withoutResponse)
         }
         _ = semaphore.wait(timeout: .now() + Self.ackTimeout)
         DispatchQueue.main.async { [weak self] in self?.imageAck = nil }
+        return outcome.value
     }
 
     private func writeChar(for peripheral: CBPeripheral) -> CBCharacteristic? {
@@ -703,7 +735,7 @@ public final class EvenG1SDK: NSObject, ObservableObject {
                 // way the sender should stop waiting and move on.
                 let ok = data.count > 1 && data[1] == 0xC9
                 decoded = ok ? "Image chunk ack" : "Image chunk NAK: \(hex)"
-                imageAck?()
+                imageAck?(ok)
                 imageAck = nil
             case .notification: // 0x4B
                 decoded = "Notification RX"
@@ -932,4 +964,18 @@ public extension EvenG1SDK {
 func trace(_ message: @autoclosure () -> String) {
     guard EvenG1SDK.isTracingEnabled else { return }
     print("[EvenG1Kit] \(message())")
+}
+
+
+/// One value, guarded, so a result can cross the queue the semaphore separates.
+final class Locked<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Value
+
+    init(_ value: Value) { stored = value }
+
+    var value: Value {
+        get { lock.lock(); defer { lock.unlock() }; return stored }
+        set { lock.lock(); stored = newValue; lock.unlock() }
+    }
 }

@@ -491,7 +491,11 @@ public struct EvenG1Protocol {
     // MARK: - Images (BMP)
     
     public struct Bmp {
-        static let maxLength = 194
+        /// The firmware takes 180 bytes per packet, and the first chunk spends
+        /// six of them on the opcode, the sequence and the four address bytes.
+        /// The old 194 made that first packet 200 bytes — over the limit, the
+        /// same way the notification chunks were before they were fixed.
+        static let maxLength = 174
         static let address: [UInt8] = [0x00, 0x1C, 0x00, 0x00]
         
         public static func data(image: Data) -> [Data] {
