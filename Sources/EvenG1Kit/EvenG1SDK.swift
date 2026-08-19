@@ -233,6 +233,12 @@ public final class EvenG1SDK: NSObject, ObservableObject {
     
     // MARK: - Commands
     
+    /// Gap between consecutive chunks of an image transfer. Fifty-one chunks
+    /// make up one 576x136 frame, so this sets how long a frame takes to arrive.
+    private static let imageChunkInterval: TimeInterval = 0.005
+    /// Image transfers pace themselves; they must not do it on the caller's thread.
+    private let imageQueue = DispatchQueue(label: "network.rubio.eveng1.image")
+
     private func sendToBoth(_ data: Data?) {
         guard let data = data else { return }
         logCommand(data, prefix: "TX (Both)")
@@ -283,19 +289,38 @@ public final class EvenG1SDK: NSObject, ObservableObject {
     }
     #endif
     
-    public func sendImage(raw: Data) {
+    /// Uploads a full-screen frame: every chunk, then the end marker, then the CRC.
+    ///
+    /// The transfer paces itself, so it runs on its own queue rather than the
+    /// caller's. That is not tidiness. Each chunk goes to the left arm at once
+    /// and to the right arm 100 ms later, on the main queue; if the caller were
+    /// the main thread, its own sleeps would keep those fifty-one right-arm
+    /// writes from running at all, and they would land back to back the moment
+    /// the loop ended -- the exact burst the gap exists to prevent.
+    ///
+    /// `completion` runs on the main queue once the last packet is out, which is
+    /// what a caller needs to hold a frame for a while and then clear it.
+    public func sendImage(raw: Data, completion: (() -> Void)? = nil) {
         let chunks = EvenG1Protocol.Bmp.data(image: raw)
-        for chunk in chunks {
-            sendToBoth(chunk)
-            Thread.sleep(forTimeInterval: 0.005)
+        let crcValue = crc32xz(of: EvenG1Protocol.Bmp.calculateCrcInput(image: raw))
+
+        imageQueue.async { [weak self] in
+            guard let self = self else { return }
+            for chunk in chunks {
+                DispatchQueue.main.async { self.sendToBoth(chunk) }
+                Thread.sleep(forTimeInterval: Self.imageChunkInterval)
+            }
+            DispatchQueue.main.async {
+                self.sendToBoth(EvenG1Protocol.Bmp.endData())
+            }
+            Thread.sleep(forTimeInterval: Self.imageChunkInterval)
+            DispatchQueue.main.async {
+                self.sendToBoth(EvenG1Protocol.Bmp.crcData(crcValue: crcValue))
+            }
+            guard let completion = completion else { return }
+            // The right arm still trails the left by the gap sendToBoth leaves.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: completion)
         }
-        
-        sendToBoth(EvenG1Protocol.Bmp.endData())
-        
-        // CRC
-        let crcInput = EvenG1Protocol.Bmp.calculateCrcInput(image: raw)
-        let crcVal = crc32xz(of: crcInput)
-        sendToBoth(EvenG1Protocol.Bmp.crcData(crcValue: crcVal))
     }
     
     public func refreshState() {
