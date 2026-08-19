@@ -84,6 +84,8 @@ public final class EvenG1SDK: NSObject, ObservableObject {
     @Published public var batteryInfo: EvenG1BatteryInfo = EvenG1BatteryInfo(left: 0, right: 0, caseBattery: nil)
     @Published public var glassesState: EvenG1GlassesState = .unknown
     @Published public var brightness: Float? = nil
+    /// Mirrors silent mode on the glasses: set by `setSilentMode(enabled:)` and
+    /// updated when the wearer triple-taps the TouchBar.
     @Published public var isSilentMode: Bool = false
     @Published public var dashPosition: Int = 0
     @Published public var wearDetectionEnabled: Bool = true
@@ -499,7 +501,14 @@ public final class EvenG1SDK: NSObject, ObservableObject {
                     switch sub {
                     case 0x01: decoded = "Single Tap"
                     case 0x00: decoded = "Double Tap"
-                    case 0x04, 0x05: decoded = "Triple Tap"
+                    // Triple tap toggles silent mode on the glasses themselves, so
+                    // the published flag has to follow the hardware, not just our
+                    // own writes. Which of the two codes means "on" is inferred from
+                    // the reference tables and has not been confirmed on a device.
+                    case 0x04, 0x05:
+                        let silent = sub == 0x04
+                        decoded = "Triple Tap (silent \(silent ? "on" : "off"))"
+                        DispatchQueue.main.async { self.isSilentMode = silent }
                     // 0x17 fires while the bar is held (Even AI starts capturing),
                     // 0x18 when it is released.
                     case 0x17: decoded = "Long Press Start"
