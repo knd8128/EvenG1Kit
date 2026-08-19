@@ -491,11 +491,19 @@ public struct EvenG1Protocol {
     // MARK: - Images (BMP)
     
     public struct Bmp {
-        /// The firmware takes 180 bytes per packet, and the first chunk spends
-        /// six of them on the opcode, the sequence and the four address bytes.
-        /// The old 194 made that first packet 200 bytes — over the limit, the
-        /// same way the notification chunks were before they were fixed.
-        static let maxLength = 174
+        /// Data bytes per chunk, making the first packet 200 bytes with its
+        /// opcode, sequence and four address bytes.
+        ///
+        /// That is over the 180-byte limit the other commands observe, and
+        /// dropping to 174 to respect it was tried on hardware and behaved
+        /// *worse* — the glasses fell into Even AI's listening screen, which
+        /// they had stopped doing. So the image path appears to take a larger
+        /// write than the rest of the protocol, and 194 is also what the
+        /// published implementations use. Recorded rather than tidied: the
+        /// limit in PROTOCOL.md is an observation, and this contradicts it.
+        static let maxLength = 194
+        /// What a chunk packet may not exceed, address header included.
+        public static let packetLimit = 200
         static let address: [UInt8] = [0x00, 0x1C, 0x00, 0x00]
         
         public static func data(image: Data) -> [Data] {

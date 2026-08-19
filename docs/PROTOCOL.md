@@ -144,12 +144,20 @@ The panel is **576 × 136**, 1 bit per pixel.
 3. Send `[0x16] + crc32`, big-endian, where the CRC-32/XZ covers the address bytes
    followed by the raw image data.
 
-Each chunk is acknowledged with `0xC9` before the next one should be sent, the same
-handshake the notifications use, and one arm is finished before the other is started.
-Skipping the wait does not slow the transfer down, it breaks it: the packets arrive,
-the firmware's receive buffer does not keep up, and it resumes reading the middle of
-the image as commands — a frame sent that way puts the glasses into Even AI's listening
-screen instead of drawing anything.
+Observed on firmware 1.6.6, with the arms answering:
+
+- The data chunks are **not** acknowledged. Nothing comes back for `0x15` at all, so the
+  gap between chunks is pacing, not a wait — 60 ms is known to work.
+- The end marker is answered `20 C9`.
+- The CRC packet is answered `16 [crc32 big-endian] [status]`, where **`0xC9` means the
+  image arrived intact and `0xCA` means it did not**. This is the only report available
+  on whether a frame landed.
+
+**Nothing else may be written while a transfer runs.** The arms take the image as a byte
+stream and a command written into the middle of one becomes part of the image. An
+8-second keepalive landing inside a 3-second transfer is what made the left arm answer
+`0xCA` while the right, whose turn came after the beat had passed, answered `0xC9` — the
+same frame, the same code, two verdicts.
 
 ## Notifications (`0x4B`)
 

@@ -210,6 +210,14 @@ public final class EvenG1SDK: NSObject, ObservableObject {
     }
     
     public func connectBy(leftId: UUID?, rightId: UUID?) {
+        // Repeated scan results called this again while the first attempt was
+        // still in flight, so every connect, every restore and every frame
+        // happened twice.
+        if leftPeripheral?.state == .connected || leftPeripheral?.state == .connecting,
+           rightPeripheral?.state == .connected || rightPeripheral?.state == .connecting {
+            trace("connectBy ignored: already connected or connecting")
+            return
+        }
         trace("connectBy called. Left: \(String(describing: leftId)), Right: \(String(describing: rightId))")
         state = .connecting
         if let l = leftId, let p = peripheralsById[l] {
@@ -240,8 +248,12 @@ public final class EvenG1SDK: NSObject, ObservableObject {
     
     /// Gap between consecutive chunks of an image transfer. Fifty-one chunks
     /// make up one 576x136 frame, so this sets how long a frame takes to arrive.
-    /// Called with the verdict when the glasses answer the chunk in flight.
-    private var imageAck: ((Bool) -> Void)?
+    /// Called when an arm reports whether the image it just received is intact.
+    private var imageVerdict: ((Bool) -> Void)?
+    /// True while a frame is on the wire; nothing else may interleave with it.
+    private var isTransferringImage = false
+    /// Commands raised during a transfer, to be sent when it finishes.
+    private var heldWrites: [Data] = []
     /// Image transfers pace themselves; not on the caller's thread.
     private let imageQueue = DispatchQueue(label: "network.rubio.eveng1.image")
     private var upkeepTimer: DispatchSourceTimer?
@@ -249,6 +261,13 @@ public final class EvenG1SDK: NSObject, ObservableObject {
 
     private func sendToBoth(_ data: Data?) {
         guard let data = data else { return }
+        // An image is a byte stream to the arms: a command written into the
+        // middle of one becomes part of the image and fails its checksum.
+        if isTransferringImage {
+            trace("Held during image transfer: \(data.map { String(format: "%02X", $0) }.joined(separator: " "))")
+            heldWrites.append(data)
+            return
+        }
         logCommand(data, prefix: "TX (Both)")
         
         // Send to Left
@@ -297,91 +316,124 @@ public final class EvenG1SDK: NSObject, ObservableObject {
     }
     #endif
     
-    /// What a transfer actually did, since the display cannot be looked at
-    /// from here and an image that never draws looks the same as one that
-    /// never arrived.
+    /// What a transfer actually did.
+    ///
+    /// The verdict is not something to be inferred from chunk replies: this
+    /// firmware does not answer the data packets at all. It answers the end
+    /// marker with `0x20 0xC9`, and the CRC packet with the checksum it
+    /// computed plus a status byte — `0xC9` if the image landed intact, `0xCA`
+    /// if it did not. That status is the only truth available about a display
+    /// that cannot be seen from here.
     public struct ImageTransferReport: Sendable {
-        public let packets: Int
-        public let acknowledged: Int
-        public let rejected: Int
-        public let unanswered: Int
+        /// nil when the arm never answered at all.
+        public let leftAccepted: Bool?
+        public let rightAccepted: Bool?
 
         public var summary: String {
-            "\(acknowledged)/\(packets) confirmados"
-                + (rejected > 0 ? ", \(rejected) rechazados" : "")
-                + (unanswered > 0 ? ", \(unanswered) sin respuesta" : "")
+            "Izq. \(Self.word(leftAccepted)) · Der. \(Self.word(rightAccepted))"
+        }
+
+        private static func word(_ accepted: Bool?) -> String {
+            switch accepted {
+            case true?:  return "aceptada"
+            case false?: return "rechazada"
+            case nil:    return "sin respuesta"
+            }
         }
     }
 
     /// Uploads a full-screen frame: every chunk, then the end marker, then the CRC.
     ///
-    /// The glasses acknowledge each chunk before the next one should be sent —
-    /// the same `0xC9` handshake the notification protocol documents. Without
-    /// it the firmware's receive buffer is overrun no matter how politely the
-    /// radio is fed, and it starts reading the middle of the stream as
-    /// commands: sending a frame that way put the glasses into Even AI's
-    /// listening screen instead of drawing anything.
+    /// Nothing else may go out while this runs. The arms take the image as a
+    /// byte stream and any other command written into the middle of it becomes
+    /// part of the image: an 8-second keepalive landing inside a 3-second
+    /// transfer is what made the left arm answer `0xCA` while the right, whose
+    /// turn came after the beat had passed, answered `0xC9`. Other writes are
+    /// held and sent afterwards.
     ///
     /// One arm at a time, because each keeps its own transfer state.
     public func sendImage(
         raw: Data, completion: ((ImageTransferReport) -> Void)? = nil
     ) {
-        var packets = EvenG1Protocol.Bmp.data(image: raw)
-        packets.append(EvenG1Protocol.Bmp.endData())
-        packets.append(EvenG1Protocol.Bmp.crcData(
-            crcValue: crc32xz(of: EvenG1Protocol.Bmp.calculateCrcInput(image: raw))))
+        let chunks = EvenG1Protocol.Bmp.data(image: raw)
+        let endMarker = EvenG1Protocol.Bmp.endData()
+        let crcPacket = EvenG1Protocol.Bmp.crcData(
+            crcValue: crc32xz(of: EvenG1Protocol.Bmp.calculateCrcInput(image: raw)))
 
         imageQueue.async { [weak self] in
             guard let self = self else { return }
-            var acknowledged = 0, rejected = 0, unanswered = 0
+            DispatchQueue.main.sync { self.isTransferringImage = true }
+
+            var verdicts: [Side: Bool] = [:]
             for side in [Side.left, Side.right] {
-                for packet in packets {
-                    switch self.sendAwaitingAck(packet, to: side) {
-                    case .acknowledged: acknowledged += 1
-                    case .rejected:     rejected += 1
-                    case .unanswered:   unanswered += 1
-                    }
+                for chunk in chunks {
+                    self.writeDirectly(chunk, to: side)
+                    Thread.sleep(forTimeInterval: Self.chunkGap)
+                }
+                self.writeDirectly(endMarker, to: side)
+                Thread.sleep(forTimeInterval: Self.chunkGap)
+                if let accepted = self.writeAwaitingVerdict(crcPacket, to: side) {
+                    verdicts[side] = accepted
                 }
             }
+
             let report = ImageTransferReport(
-                packets: packets.count * 2, acknowledged: acknowledged,
-                rejected: rejected, unanswered: unanswered)
+                leftAccepted: verdicts[.left], rightAccepted: verdicts[.right])
             trace("Image transfer: \(report.summary)")
-            guard let completion = completion else { return }
-            DispatchQueue.main.async { completion(report) }
+
+            DispatchQueue.main.async {
+                self.isTransferringImage = false
+                self.flushHeldWrites()
+                completion?(report)
+            }
         }
     }
 
     enum Side { case left, right }
-    enum AckResult { case acknowledged, rejected, unanswered }
 
-    /// Writes one packet and waits for the glasses to say they took it.
-    ///
-    /// The timeout is short on purpose: if this firmware does not acknowledge
-    /// image chunks the transfer still completes, just paced by the clock
-    /// instead of by the glasses.
-    private static let ackTimeout: TimeInterval = 0.06
+    /// Gap between image packets. The chunks are never acknowledged, so this is
+    /// the pacing — not a timeout waiting for something that is coming.
+    private static let chunkGap: TimeInterval = 0.06
+    /// How long to wait for the arm's verdict on the CRC packet.
+    private static let verdictTimeout: TimeInterval = 1.5
 
-    private func sendAwaitingAck(_ data: Data, to side: Side) -> AckResult {
-        let semaphore = DispatchSemaphore(value: 0)
-        let outcome = Locked<AckResult>(.unanswered)
+    private func writeDirectly(_ data: Data, to side: Side) {
         DispatchQueue.main.async { [weak self] in
-            guard let self = self else { semaphore.signal(); return }
+            guard let self = self else { return }
             let peripheral = side == .left ? self.leftPeripheral : self.rightPeripheral
             guard let peripheral = peripheral,
-                  let characteristic = self.writeChar(for: peripheral) else {
-                semaphore.signal()
-                return
-            }
-            self.imageAck = { ok in
-                outcome.value = ok ? .acknowledged : .rejected
-                semaphore.signal()
-            }
+                  let characteristic = self.writeChar(for: peripheral) else { return }
             peripheral.writeValue(data, for: characteristic, type: .withoutResponse)
         }
-        _ = semaphore.wait(timeout: .now() + Self.ackTimeout)
-        DispatchQueue.main.async { [weak self] in self?.imageAck = nil }
-        return outcome.value
+    }
+
+    /// Sends the CRC packet and waits for the arm to say whether the image
+    /// arrived intact. Returns nil if it never answers.
+    private func writeAwaitingVerdict(_ data: Data, to side: Side) -> Bool? {
+        let semaphore = DispatchSemaphore(value: 0)
+        let verdict = Locked<Bool?>(nil)
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { semaphore.signal(); return }
+            self.imageVerdict = { accepted in
+                verdict.value = accepted
+                semaphore.signal()
+            }
+            self.writeDirectly(data, to: side)
+        }
+        _ = semaphore.wait(timeout: .now() + Self.verdictTimeout)
+        DispatchQueue.main.async { [weak self] in self?.imageVerdict = nil }
+        return verdict.value
+    }
+
+    /// Commands raised while an image was in flight, sent once it is done.
+    private func flushHeldWrites() {
+        let held = heldWrites
+        heldWrites = []
+        for (index, data) in held.enumerated() {
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(index) * 0.12) {
+                self.sendToBoth(data)
+            }
+        }
     }
 
     private func writeChar(for peripheral: CBPeripheral) -> CBCharacteristic? {
@@ -702,9 +754,11 @@ public final class EvenG1SDK: NSObject, ObservableObject {
                     }
                 }
             case .brightnessState: // 0x29
-                // Response: 29 [Level 00~2A] [Auto 00/01]
+                // Observed on firmware 1.6.6: 29 65 2A, where 0x2A is the level
+                // that was just set and 0x65 is not it. Reading data[1] as the
+                // level reported 101 out of 42 and pinned the readback at full.
                 if data.count >= 3 {
-                    let level = Float(data[1])
+                    let level = Float(data[2])
                     let maxLevel: Float = 42.0
                     let normalized = min(max(level / maxLevel, 0.0), 1.0)
                     DispatchQueue.main.async {
@@ -730,13 +784,13 @@ public final class EvenG1SDK: NSObject, ObservableObject {
                 }
             case .statusGet: // 0x22
                 decoded = "Status: \(hex)"
-            case .bmp: // 0x15 — the reply to an image chunk
-                // 0xC9 is "took it"; anything else is a complaint, and either
-                // way the sender should stop waiting and move on.
-                let ok = data.count > 1 && data[1] == 0xC9
-                decoded = ok ? "Image chunk ack" : "Image chunk NAK: \(hex)"
-                imageAck?(ok)
-                imageAck = nil
+            case .bmpShow: // 0x16 — the arm's verdict on the image just sent
+                // 16 [crc32 big-endian] [status], where 0xC9 means the image
+                // arrived intact and 0xCA means it did not.
+                let accepted = data.count >= 6 && data[5] == 0xC9
+                decoded = accepted ? "Image accepted" : "Image rejected: \(hex)"
+                imageVerdict?(accepted)
+                imageVerdict = nil
             case .notification: // 0x4B
                 decoded = "Notification RX"
             case .firmwareInfoRes: // 0x6E
@@ -872,7 +926,9 @@ extension EvenG1SDK: CBCentralManagerDelegate, CBPeripheralDelegate {
         if !leftLinked && !rightLinked {
             state = .idle
             stopUpkeep()
-            imageAck = nil
+            imageVerdict = nil
+            isTransferringImage = false
+            heldWrites = []
         } else if !leftOk && !rightOk {
             state = .connecting
         } else {
@@ -958,12 +1014,21 @@ extension EvenG1SDK {
 /// set `EvenG1SDK.isTracingEnabled = true` while debugging a connection.
 public extension EvenG1SDK {
     static var isTracingEnabled = false
+
+    /// Where trace lines go. Unset, they go to stderr.
+    ///
+    /// A host app on a physical device usually cannot read either stream —
+    /// `print` block-buffers when stdout is not a terminal, and the console a
+    /// device is launched with does not reliably carry it — so the app is left
+    /// to decide, typically by appending to a file it can fetch afterwards.
+    static var traceSink: ((String) -> Void)?
 }
 
 @inline(__always)
 func trace(_ message: @autoclosure () -> String) {
     guard EvenG1SDK.isTracingEnabled else { return }
-    print("[EvenG1Kit] \(message())")
+    let line = "[EvenG1Kit] \(message())"
+    if let sink = EvenG1SDK.traceSink { sink(line) } else { fputs(line + "\n", stderr) }
 }
 
 

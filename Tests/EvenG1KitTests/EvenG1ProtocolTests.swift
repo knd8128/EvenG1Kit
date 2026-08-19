@@ -40,7 +40,7 @@ final class EvenG1ProtocolTests: XCTestCase {
         let image = Data(repeating: 0xAB, count: 500)
         let chunks = EvenG1Protocol.Bmp.data(image: image)
 
-        XCTAssertEqual(chunks.count, 3) // 174 + 174 + 152
+        XCTAssertEqual(chunks.count, 3) // 194 + 194 + 112
         XCTAssertEqual(Array(chunks[0].prefix(6)), [0x15, 0x00, 0x00, 0x1C, 0x00, 0x00])
         XCTAssertEqual(Array(chunks[1].prefix(2)), [0x15, 0x01])
         // Sizes are asserted against the firmware's packet limit, not a
@@ -107,14 +107,16 @@ final class EvenG1ProtocolTests: XCTestCase {
 
 
 extension EvenG1ProtocolTests {
-    func testNoImagePacketExceedsWhatTheFirmwareTakes() {
-        // 180 bytes per packet, and the first chunk also carries four address
-        // bytes. Going over is silent: the packet simply never lands.
+    func testNoImagePacketExceedsTheChunkLimit() {
+        // The image path takes a larger write than the rest of the protocol;
+        // see the note on Bmp.maxLength for why this is not the 180 the other
+        // commands observe. Either way the header must not push a packet past
+        // whatever the limit is, which is the mistake that has to stay caught.
         let frame = Data(repeating: 0xA5, count: 576 * 136 / 8)
         let packets = EvenG1Protocol.Bmp.data(image: frame)
         for (index, packet) in packets.enumerated() {
             XCTAssertLessThanOrEqual(
-                packet.count, 180,
+                packet.count, EvenG1Protocol.Bmp.packetLimit,
                 "chunk \(index) is \(packet.count) bytes, over the packet limit")
         }
     }
