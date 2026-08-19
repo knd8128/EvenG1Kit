@@ -250,10 +250,13 @@ public final class EvenG1SDK: NSObject, ObservableObject {
     /// make up one 576x136 frame, so this sets how long a frame takes to arrive.
     /// Called when an arm reports whether the image it just received is intact.
     private var imageVerdict: ((Bool) -> Void)?
+    /// Signalled when a confirmed write comes back from the peripheral.
+    private var writeConfirmation: ((Bool) -> Void)?
     /// True while a frame is on the wire; nothing else may interleave with it.
     private var isTransferringImage = false
     /// Commands raised during a transfer, to be sent when it finishes.
     private var heldWrites: [Data] = []
+    private var heldRightWrites: [Data] = []
     /// Image transfers pace themselves; not on the caller's thread.
     private let imageQueue = DispatchQueue(label: "network.rubio.eveng1.image")
     private var upkeepTimer: DispatchSourceTimer?
@@ -264,7 +267,7 @@ public final class EvenG1SDK: NSObject, ObservableObject {
         // An image is a byte stream to the arms: a command written into the
         // middle of one becomes part of the image and fails its checksum.
         if isTransferringImage {
-            trace("Held during image transfer: \(data.map { String(format: "%02X", $0) }.joined(separator: " "))")
+            trace("Held during image transfer: \(Self.hex(data))")
             heldWrites.append(data)
             return
         }
@@ -290,8 +293,21 @@ public final class EvenG1SDK: NSObject, ObservableObject {
     
     private func sendToRight(_ data: Data?) {
         guard let data = data, let r = rightPeripheral, let c = rightWriteChar else { return }
+        // Same reason as sendToBoth: a command written into the middle of an
+        // image becomes part of it. Every state query the SDK makes comes
+        // through here, and they are aimed at the right arm — the one whose
+        // transfer runs second, and so the one they land in.
+        if isTransferringImage {
+            trace("Held during image transfer (right): \(Self.hex(data))")
+            heldRightWrites.append(data)
+            return
+        }
         logCommand(data, prefix: "TX (Right)")
         r.writeValue(data, for: c, type: .withoutResponse)
+    }
+
+    static func hex(_ data: Data) -> String {
+        data.map { String(format: "%02X", $0) }.joined(separator: " ")
     }
     
     private func sendData(_ data: Data, to peripheral: CBPeripheral) {
@@ -355,7 +371,15 @@ public final class EvenG1SDK: NSObject, ObservableObject {
     public func sendImage(
         raw: Data, completion: ((ImageTransferReport) -> Void)? = nil
     ) {
-        let chunks = EvenG1Protocol.Bmp.data(image: raw)
+        // Sized against what both arms will actually take. A write larger than
+        // the negotiated maximum is not truncated, it is dropped, and nothing
+        // says so — the image simply fails its checksum at the far end.
+        let room = [leftPeripheral, rightPeripheral]
+            .compactMap { $0?.maximumWriteValueLength(for: .withoutResponse) }
+            .min() ?? EvenG1Protocol.Bmp.maxLength + 6
+        let chunks = EvenG1Protocol.Bmp.data(image: raw, maxLength: max(16, min(
+            EvenG1Protocol.Bmp.maxLength, room - 6)))
+        trace("Image: \(chunks.count) chunks, arms take \(room) bytes per write")
         let endMarker = EvenG1Protocol.Bmp.endData()
         let crcPacket = EvenG1Protocol.Bmp.crcData(
             crcValue: crc32xz(of: EvenG1Protocol.Bmp.calculateCrcInput(image: raw)))
@@ -365,15 +389,23 @@ public final class EvenG1SDK: NSObject, ObservableObject {
             DispatchQueue.main.sync { self.isTransferringImage = true }
 
             var verdicts: [Side: Bool] = [:]
+            // Left first, as every other command goes. The order was tried both
+            // ways on hardware and made no difference — which arm rejects is a
+            // property of the arm, not of when its turn comes.
+            //
+            // And it is worth retrying: the left arm turns down the first frame
+            // after a connection and takes the next one, so the arms tell us
+            // when they are unhappy and there is no reason not to listen.
             for side in [Side.left, Side.right] {
-                for chunk in chunks {
-                    self.writeDirectly(chunk, to: side)
-                    Thread.sleep(forTimeInterval: Self.chunkGap)
-                }
-                self.writeDirectly(endMarker, to: side)
-                Thread.sleep(forTimeInterval: Self.chunkGap)
-                if let accepted = self.writeAwaitingVerdict(crcPacket, to: side) {
+                for attempt in 1...Self.transferAttempts {
+                    var lost = 0
+                    for chunk in chunks where !self.writeConfirmed(chunk, to: side) { lost += 1 }
+                    if lost > 0 { trace("\(side) lost \(lost) of \(chunks.count) chunks") }
+                    self.writeConfirmed(endMarker, to: side)
+                    let accepted = self.writeAwaitingVerdict(crcPacket, to: side)
                     verdicts[side] = accepted
+                    if accepted == true { break }
+                    trace("\(side) rejected the frame on attempt \(attempt)")
                 }
             }
 
@@ -391,20 +423,44 @@ public final class EvenG1SDK: NSObject, ObservableObject {
 
     enum Side { case left, right }
 
-    /// Gap between image packets. The chunks are never acknowledged, so this is
-    /// the pacing — not a timeout waiting for something that is coming.
-    private static let chunkGap: TimeInterval = 0.06
+    /// A confirmed write should come back in milliseconds; this is only here
+    /// so a silent link cannot wedge the transfer.
+    private static let writeTimeout: TimeInterval = 1.0
+    /// How many times to offer a frame to an arm that turns it down.
+    private static let transferAttempts = 2
     /// How long to wait for the arm's verdict on the CRC packet.
     private static let verdictTimeout: TimeInterval = 1.5
 
-    private func writeDirectly(_ data: Data, to side: Side) {
+    /// Writes one image packet and waits for the peripheral to confirm it.
+    ///
+    /// `.withResponse`, not `.withoutResponse`. An unresponded write is fire
+    /// and forget: Core Bluetooth drops it when its buffer is full and says
+    /// nothing, and pacing the sends from another queue does not help, because
+    /// the writes themselves still run whenever the main queue gets to them —
+    /// which is all at once if it was busy. The arms were receiving a frame
+    /// with holes in it and rejecting it on the checksum, every time. A
+    /// confirmed write is delivered or it is an error.
+    @discardableResult
+    private func writeConfirmed(_ data: Data, to side: Side) -> Bool {
+        let semaphore = DispatchSemaphore(value: 0)
+        let delivered = Locked<Bool>(false)
         DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
+            guard let self = self else { semaphore.signal(); return }
             let peripheral = side == .left ? self.leftPeripheral : self.rightPeripheral
             guard let peripheral = peripheral,
-                  let characteristic = self.writeChar(for: peripheral) else { return }
-            peripheral.writeValue(data, for: characteristic, type: .withoutResponse)
+                  let characteristic = self.writeChar(for: peripheral) else {
+                semaphore.signal()
+                return
+            }
+            self.writeConfirmation = { ok in
+                delivered.value = ok
+                semaphore.signal()
+            }
+            peripheral.writeValue(data, for: characteristic, type: .withResponse)
         }
+        _ = semaphore.wait(timeout: .now() + Self.writeTimeout)
+        DispatchQueue.main.async { [weak self] in self?.writeConfirmation = nil }
+        return delivered.value
     }
 
     /// Sends the CRC packet and waits for the arm to say whether the image
@@ -418,7 +474,10 @@ public final class EvenG1SDK: NSObject, ObservableObject {
                 verdict.value = accepted
                 semaphore.signal()
             }
-            self.writeDirectly(data, to: side)
+            let peripheral = side == .left ? self.leftPeripheral : self.rightPeripheral
+            if let peripheral = peripheral, let char = self.writeChar(for: peripheral) {
+                peripheral.writeValue(data, for: char, type: .withResponse)
+            }
         }
         _ = semaphore.wait(timeout: .now() + Self.verdictTimeout)
         DispatchQueue.main.async { [weak self] in self?.imageVerdict = nil }
@@ -427,12 +486,21 @@ public final class EvenG1SDK: NSObject, ObservableObject {
 
     /// Commands raised while an image was in flight, sent once it is done.
     private func flushHeldWrites() {
-        let held = heldWrites
+        let both = heldWrites, right = heldRightWrites
         heldWrites = []
-        for (index, data) in held.enumerated() {
-            DispatchQueue.main.asyncAfter(deadline: .now() + Double(index) * 0.12) {
+        heldRightWrites = []
+        var slot = 0
+        for data in both {
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(slot) * 0.12) {
                 self.sendToBoth(data)
             }
+            slot += 1
+        }
+        for data in right {
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(slot) * 0.12) {
+                self.sendToRight(data)
+            }
+            slot += 1
         }
     }
 
@@ -929,6 +997,7 @@ extension EvenG1SDK: CBCentralManagerDelegate, CBPeripheralDelegate {
             imageVerdict = nil
             isTransferringImage = false
             heldWrites = []
+            heldRightWrites = []
         } else if !leftOk && !rightOk {
             state = .connecting
         } else {
@@ -941,6 +1010,14 @@ extension EvenG1SDK: CBCentralManagerDelegate, CBPeripheralDelegate {
     /// True once at least one arm can actually be written to.
     private var isUsable: Bool { leftWriteChar != nil || rightWriteChar != nil }
     
+    public func peripheral(
+        _ p: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?
+    ) {
+        if let error = error { trace("Write failed: \(error.localizedDescription)") }
+        writeConfirmation?(error == nil)
+        writeConfirmation = nil
+    }
+
     public func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) {
         trace("Discovered Services for \(p.name ?? "Unknown")")
         p.services?.forEach { p.discoverCharacteristics([charWriteUUID, charNotifyUUID], for: $0) }
@@ -969,6 +1046,11 @@ extension EvenG1SDK: CBCentralManagerDelegate, CBPeripheralDelegate {
                     rightNotifyChar = ch
                 }
             }
+        }
+        if writeChar(for: p) != nil {
+            trace("\(p == leftPeripheral ? "Left" : "Right") max write "
+                  + "\(p.maximumWriteValueLength(for: .withoutResponse)) bytes "
+                  + "(withResponse \(p.maximumWriteValueLength(for: .withResponse)))")
         }
         // The arm only becomes usable here, so this is where "connected" can
         // honestly be reported.

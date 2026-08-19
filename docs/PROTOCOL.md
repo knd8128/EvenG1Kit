@@ -153,6 +153,18 @@ Observed on firmware 1.6.6, with the arms answering:
   image arrived intact and `0xCA` means it did not**. This is the only report available
   on whether a frame landed.
 
+Image packets must be written **with response**. An unresponded write is fire and
+forget: Core Bluetooth drops it when its buffer is full and reports nothing, and pacing
+the sends from another queue does not help because the writes still run whenever the
+main queue reaches them. The arms were receiving frames with holes and rejecting them on
+the checksum. With confirmed writes the right arm accepts every frame.
+
+**The left arm rejects frames the right arm accepts** — the same bytes, the same code,
+answered `0xCA` by one and `0xC9` by the other. Tried and ruled out: sending to the
+right first, retrying, and clearing with `0x18` beforehand. It is a property of the arm.
+Note that text sent to both arms also only appears in the right lens, so this may be
+the display's own geometry rather than a fault.
+
 **Nothing else may be written while a transfer runs.** The arms take the image as a byte
 stream and a command written into the middle of one becomes part of the image. An
 8-second keepalive landing inside a 3-second transfer is what made the left arm answer

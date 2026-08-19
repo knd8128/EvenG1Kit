@@ -501,12 +501,12 @@ public struct EvenG1Protocol {
         /// write than the rest of the protocol, and 194 is also what the
         /// published implementations use. Recorded rather than tidied: the
         /// limit in PROTOCOL.md is an observation, and this contradicts it.
-        static let maxLength = 194
+        public static let maxLength = 194
         /// What a chunk packet may not exceed, address header included.
         public static let packetLimit = 200
         static let address: [UInt8] = [0x00, 0x1C, 0x00, 0x00]
         
-        public static func data(image: Data) -> [Data] {
+        public static func data(image: Data, maxLength: Int = maxLength) -> [Data] {
             let cmd = EvenG1Cmd.bmp.rawValue
             var chunks: [Data] = []
             var offset = 0
