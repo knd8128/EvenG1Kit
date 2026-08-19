@@ -240,10 +240,10 @@ public final class EvenG1SDK: NSObject, ObservableObject {
     
     /// Gap between consecutive chunks of an image transfer. Fifty-one chunks
     /// make up one 576x136 frame, so this sets how long a frame takes to arrive.
-    /// Packets waiting for each arm's radio, keyed by peripheral.
-    private var outbox: [ObjectIdentifier: [Data]] = [:]
-    /// Called once every queued packet has been handed to the radio.
-    private var outboxDrained: (() -> Void)?
+    /// Signalled when the glasses acknowledge the chunk in flight.
+    private var imageAck: (() -> Void)?
+    /// Image transfers pace themselves; not on the caller's thread.
+    private let imageQueue = DispatchQueue(label: "network.rubio.eveng1.image")
     private var upkeepTimer: DispatchSourceTimer?
     private var upkeepTicks = 0
 
@@ -299,64 +299,61 @@ public final class EvenG1SDK: NSObject, ObservableObject {
     
     /// Uploads a full-screen frame: every chunk, then the end marker, then the CRC.
     ///
-    /// A frame is fifty-one packets per arm, and the radio cannot take them as
-    /// fast as a loop can hand them over. Core Bluetooth accepts an unresponded
-    /// write only while `canSendWriteWithoutResponse` is true and **silently
-    /// drops the rest** — no error, no delegate call, the image simply never
-    /// arrives. Pacing with sleeps, as this used to, is guessing at a number the
-    /// system will tell you exactly: the packets queue here and go out as the
-    /// radio reports it is ready.
+    /// The glasses acknowledge each chunk before the next one should be sent —
+    /// the same `0xC9` handshake the notification protocol documents. Without
+    /// it the firmware's receive buffer is overrun no matter how politely the
+    /// radio is fed, and it starts reading the middle of the stream as
+    /// commands: sending a frame this way put the glasses into Even AI's
+    /// listening screen instead of drawing anything.
     ///
-    /// `completion` runs once the last packet of both arms has been handed over.
+    /// One arm at a time, because each keeps its own transfer state.
     public func sendImage(raw: Data, completion: (() -> Void)? = nil) {
         var packets = EvenG1Protocol.Bmp.data(image: raw)
         packets.append(EvenG1Protocol.Bmp.endData())
         packets.append(EvenG1Protocol.Bmp.crcData(
             crcValue: crc32xz(of: EvenG1Protocol.Bmp.calculateCrcInput(image: raw))))
 
-        DispatchQueue.main.async { [weak self] in
+        imageQueue.async { [weak self] in
             guard let self = self else { return }
-            self.outboxDrained = completion
-            self.enqueue(packets)
+            for side in [Side.left, Side.right] {
+                for packet in packets {
+                    self.sendAwaitingAck(packet, to: side)
+                }
+            }
+            trace("Image transfer finished")
+            guard let completion = completion else { return }
+            DispatchQueue.main.async(execute: completion)
         }
     }
 
-    // MARK: - Flow-controlled writes
-    //
-    // Only bulk transfers go through here. Single commands keep the old path:
-    // they are one packet and never fill the buffer.
+    enum Side { case left, right }
+
+    /// Writes one packet and waits for the glasses to say they took it.
+    ///
+    /// The timeout is short on purpose: if this firmware does not acknowledge
+    /// image chunks the transfer still completes, just paced by the clock
+    /// instead of by the glasses.
+    private static let ackTimeout: TimeInterval = 0.06
+
+    private func sendAwaitingAck(_ data: Data, to side: Side) {
+        let semaphore = DispatchSemaphore(value: 0)
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { semaphore.signal(); return }
+            let peripheral = side == .left ? self.leftPeripheral : self.rightPeripheral
+            guard let peripheral = peripheral,
+                  let characteristic = self.writeChar(for: peripheral) else {
+                semaphore.signal()
+                return
+            }
+            self.imageAck = { semaphore.signal() }
+            peripheral.writeValue(data, for: characteristic, type: .withoutResponse)
+        }
+        _ = semaphore.wait(timeout: .now() + Self.ackTimeout)
+        DispatchQueue.main.async { [weak self] in self?.imageAck = nil }
+    }
 
     private func writeChar(for peripheral: CBPeripheral) -> CBCharacteristic? {
         peripheral == leftPeripheral ? leftWriteChar : rightWriteChar
-    }
-
-    /// Queues the same packets for both arms and starts them moving.
-    private func enqueue(_ packets: [Data]) {
-        for peripheral in [leftPeripheral, rightPeripheral] {
-            guard let peripheral = peripheral, writeChar(for: peripheral) != nil else { continue }
-            outbox[ObjectIdentifier(peripheral), default: []].append(contentsOf: packets)
-        }
-        for peripheral in [leftPeripheral, rightPeripheral] {
-            guard let peripheral = peripheral else { continue }
-            drain(peripheral)
-        }
-    }
-
-    private func drain(_ peripheral: CBPeripheral) {
-        guard let characteristic = writeChar(for: peripheral) else { return }
-        let key = ObjectIdentifier(peripheral)
-        while peripheral.canSendWriteWithoutResponse, let next = outbox[key]?.first {
-            outbox[key]?.removeFirst()
-            peripheral.writeValue(next, for: characteristic, type: .withoutResponse)
-        }
-        guard outbox.values.allSatisfy({ $0.isEmpty }), let done = outboxDrained else { return }
-        outboxDrained = nil
-        trace("Bulk transfer drained")
-        DispatchQueue.main.async(execute: done)
-    }
-
-    public func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
-        drain(peripheral)
     }
 
     // MARK: - Upkeep
@@ -701,6 +698,13 @@ public final class EvenG1SDK: NSObject, ObservableObject {
                 }
             case .statusGet: // 0x22
                 decoded = "Status: \(hex)"
+            case .bmp: // 0x15 — the reply to an image chunk
+                // 0xC9 is "took it"; anything else is a complaint, and either
+                // way the sender should stop waiting and move on.
+                let ok = data.count > 1 && data[1] == 0xC9
+                decoded = ok ? "Image chunk ack" : "Image chunk NAK: \(hex)"
+                imageAck?()
+                imageAck = nil
             case .notification: // 0x4B
                 decoded = "Notification RX"
             case .firmwareInfoRes: // 0x6E
@@ -836,8 +840,7 @@ extension EvenG1SDK: CBCentralManagerDelegate, CBPeripheralDelegate {
         if !leftLinked && !rightLinked {
             state = .idle
             stopUpkeep()
-            outbox.removeAll()
-            outboxDrained = nil
+            imageAck = nil
         } else if !leftOk && !rightOk {
             state = .connecting
         } else {

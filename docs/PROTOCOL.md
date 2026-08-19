@@ -141,6 +141,13 @@ The panel is **576 × 136**, 1 bit per pixel.
 3. Send `[0x16] + crc32`, big-endian, where the CRC-32/XZ covers the address bytes
    followed by the raw image data.
 
+Each chunk is acknowledged with `0xC9` before the next one should be sent, the same
+handshake the notifications use, and one arm is finished before the other is started.
+Skipping the wait does not slow the transfer down, it breaks it: the packets arrive,
+the firmware's receive buffer does not keep up, and it resumes reading the middle of
+the image as commands — a frame sent that way puts the glasses into Even AI's listening
+screen instead of drawing anything.
+
 ## Notifications (`0x4B`)
 
 Chunked JSON, header `[0x4B, 0x00, totalChunks, chunkIndex]` per chunk. The header eats
