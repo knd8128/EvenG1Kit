@@ -159,7 +159,12 @@ public final class EvenG1SDK: NSObject, ObservableObject {
                 guard let self = self else { return }
                 self.central.stopScan()
                 trace("Scan Timeout. Results: \(self.scanResults.count), Pairs: \(self.pairs.count)")
-                if self.scanResults.isEmpty && self.pairs.isEmpty {
+                if self.isUsable {
+                    // Already talking to a pair; the timeout is just the scan
+                    // ending. Reporting "incomplete pair" here is what put
+                    // «lentes incompletos» on screen next to a live link.
+                    trace("Scan timeout while connected -- nothing to select")
+                } else if self.scanResults.isEmpty && self.pairs.isEmpty {
                     self.state = .idle
                     self.lastError = .scanTimeout
                     self.delegate?.didScanTimeout()
@@ -815,21 +820,35 @@ extension EvenG1SDK: CBCentralManagerDelegate, CBPeripheralDelegate {
     }
     
     private func checkConnectionState() {
-        let leftOk = (leftPeripheral?.state == .connected)
-        let rightOk = (rightPeripheral?.state == .connected)
-        trace("Connection State Check - Left: \(leftOk), Right: \(rightOk)")
-        
-        if !leftOk && !rightOk {
+        let leftLinked = (leftPeripheral?.state == .connected)
+        let rightLinked = (rightPeripheral?.state == .connected)
+        // A link you cannot write to is not a connection. `didConnect` fires
+        // before service discovery, so an arm reports itself connected while
+        // its write characteristic is still nil and everything sent to it is
+        // dropped on the floor -- which is why a splash sent the moment the
+        // glasses "connected" only ever reached the arm that happened to
+        // finish discovering first.
+        let leftOk = leftLinked && leftWriteChar != nil
+        let rightOk = rightLinked && rightWriteChar != nil
+        trace("Connection State Check - Left: \(leftOk) (linked \(leftLinked)), "
+              + "Right: \(rightOk) (linked \(rightLinked))")
+
+        if !leftLinked && !rightLinked {
             state = .idle
             stopUpkeep()
             outbox.removeAll()
             outboxDrained = nil
+        } else if !leftOk && !rightOk {
+            state = .connecting
         } else {
             state = .connected(left: leftOk, right: rightOk)
             if leftOk && rightOk { startUpkeep() }
         }
         delegate?.didChangeConnectionState(state)
     }
+
+    /// True once at least one arm can actually be written to.
+    private var isUsable: Bool { leftWriteChar != nil || rightWriteChar != nil }
     
     public func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) {
         trace("Discovered Services for \(p.name ?? "Unknown")")
@@ -860,6 +879,9 @@ extension EvenG1SDK: CBCentralManagerDelegate, CBPeripheralDelegate {
                 }
             }
         }
+        // The arm only becomes usable here, so this is where "connected" can
+        // honestly be reported.
+        checkConnectionState()
     }
     
     public func peripheral(_ p: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
