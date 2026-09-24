@@ -264,21 +264,28 @@ public struct EvenG1Protocol {
     
     // MARK: - Text / Teleprompter
     
-    public static func textData(text: String) -> Data? {
+    /// One page of text for the display.
+    ///
+    /// `page` and `pageCount` are what the firmware shows as the pager; the
+    /// caller decides where the page boundaries fall (the packet carries one
+    /// page and the firmware drops what does not fit). `seq` distinguishes
+    /// consecutive messages and wraps on its own.
+    public static func textData(
+        text: String, seq: UInt8 = 0, page: UInt8 = 0, pageCount: UInt8 = 1
+    ) -> Data? {
         guard let textData = text.data(using: .utf8) else { return nil }
         let cmd = EvenG1Cmd.text.rawValue
-        let seq: UInt8 = 0x00
         let numItems: UInt8 = 0x01
         let item: UInt8 = 0x00
         let newScreen: UInt8 = 0x71 // 0x01 (new content) | 0x70 (text show)
         let newCharPos: [UInt8] = [0x00, 0x00]
-        let pageNum: UInt8 = 0x00
-        let pageCount: UInt8 = 0x01
-        
-        let controlArr = [cmd, seq, numItems, item, newScreen] + newCharPos + [pageNum, pageCount]
+        let count = max(pageCount, 1)
+
+        let controlArr = [cmd, seq, numItems, item, newScreen] + newCharPos
+            + [min(page, count - 1), count]
         return Data(controlArr) + textData
     }
-    
+
     public struct Teleprompter {
         static private var seq: UInt8 = 0x00
         

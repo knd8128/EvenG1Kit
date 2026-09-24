@@ -129,7 +129,9 @@ Responses carry a status byte: `0xC9` success, `0xCA` failure, `0xCB` more data 
 - `0x61` — network error
 
 The display is 488 px wide at 21 px per glyph: about 40 characters per line, 5 lines per
-screen, up to 255 pages.
+screen, up to 255 pages. `pageNum`/`pageCount` only drive the pager the display draws:
+each packet still carries exactly one page, and the phone sends the next one when the
+wearer single-taps (`0xF5 0x01`).
 
 ## Images
 

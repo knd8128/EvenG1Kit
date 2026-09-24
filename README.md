@@ -33,16 +33,16 @@ EvenG1SDK.shared.sendText("Good morning")
 | Area | API |
 |------|-----|
 | Discovery and pairing | `startScan(timeout:)`, `connect(pair:)`, `connectBy(leftId:rightId:)`, `disconnect()` |
-| Text on the display | `sendText(_:)`, `sendTeleprompter(visible:next:progress:isFirst:)` |
-| Images | `sendImage(_:)` (UIImage → 1-bit 576×136), `sendImage(raw:)`, `hideImage()` |
+| Text on the display | `sendText(_:page:pageCount:)`, `sendTeleprompter(visible:next:progress:isFirst:)` |
+| Images | `sendImage(_:)` (UIImage → 1-bit 576×136), `sendImage(raw:)` (async, returns each arm's verdict), `hideImage()` |
 | Dashboard | `sendDashboard(mode:subMode:)`, `sendDashboardConfig(isShow:vertical:distance:)`, `sendWeather(temperature:icon:isCelsius:)` |
 | Notifications | `sendNotification(_:)`, `clearNotification(id:)` |
 | Microphone | `setMicEnabled(_:)` — audio arrives as LC3 frames in `didReceiveMicAudio` |
 | Settings | `setBrightness(level:auto:)`, `setSilentMode(enabled:)`, `setWearDetection(enabled:)`, `setLanguage(_:)` |
 | Device state | `refreshState()`, `refreshDeviceInfo()`, `reboot()`, `factoryReset()` |
 
-State the glasses report — battery per arm, wear state, brightness, firmware, serial —
-is published on the SDK object, so SwiftUI can observe it directly:
+State the glasses report — battery per arm, wear state, brightness level, silent mode,
+firmware, serial — is published on the SDK object, so SwiftUI can observe it directly:
 
 ```swift
 @StateObject private var glasses = EvenG1SDK.shared
@@ -53,15 +53,32 @@ Text("\(glasses.batteryInfo.left)% / \(glasses.batteryInfo.right)%")
 ## Delegate
 
 `EvenG1Delegate` reports discovery, connection changes, reconnection attempts, TouchBar
-gestures, incoming microphone audio, and a decoded log of every inbound packet. Battery
-and wear-state callbacks have default implementations, so you only implement what you use.
+gestures (typed, `G1Touch`), incoming microphone audio, and every decoded inbound packet
+(`G1Inbound`). Every method has an empty default, so you implement only what you use.
 
 ```swift
-func didReceiveTouchEvent(side: String, type: String) {
-    guard type == "Long Press Start" else { return }
-    EvenG1SDK.shared.setMicEnabled(true)   // Even AI capture starts
+func glasses(_ sdk: EvenG1SDK, didReceiveTouch gesture: G1Touch, from side: G1Side) {
+    switch gesture {
+    case .singleTap:      pager.next()                 // page forward
+    case .longPressBegan: sdk.setMicEnabled(true)      // Even AI capture starts
+    case .longPressEnded: sdk.setMicEnabled(false)
+    default: break
+    }
 }
 ```
+
+## How the wire is driven
+
+Each arm has its own outbox (`ArmOutbox`): writes to one arm keep a 100 ms gap, a
+command for both arms goes to the left and then to the right 100 ms after the left
+write actually went out, and both queues pause while an image is on the wire and drain
+afterwards in order. Image packets are written with response and each arm's verdict on
+the checksum is returned. None of this touches the caller's thread; the SDK is
+main-thread only, like Core Bluetooth with the main queue.
+
+Inbound packets are decoded by `G1Inbound.decode(_:)`, a pure function with its own
+tests — the brightness readback, the image verdict byte and the wear-state byte are
+pinned there rather than remembered.
 
 ## Protocol
 
@@ -75,14 +92,14 @@ out:
 
 ```swift
 EvenG1SDK.isTracingEnabled = true
+EvenG1SDK.traceSink = { line in myLog.append(line) }   // optional; stderr otherwise
 ```
 
 ## Caveats
 
 - `sendText` writes a single page. Longer copy is truncated by the firmware — paginate
   upstream if you need more.
-- Image upload and chunked notifications pace their writes with `Thread.sleep`, so call
-  them off the main thread.
+- The SDK is main-thread only: create it, call it and observe it from the main thread.
 - Locks, garage doors, and anything safety-critical are not part of the G1 protocol; this
   package only drives the display, the microphone, and device settings.
 

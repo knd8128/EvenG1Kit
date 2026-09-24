@@ -132,3 +132,34 @@ extension EvenG1ProtocolTests {
         XCTAssertEqual(rebuilt, frame)
     }
 }
+
+extension EvenG1ProtocolTests {
+    func testTextCarriesPageAndPageCount() {
+        let data = EvenG1Protocol.textData(text: "Hola", seq: 7, page: 1, pageCount: 3)!
+        // [0x4E] [seq] [numItems] [item] [screen] [posHi] [posLo] [page] [count]
+        XCTAssertEqual(Array(data.prefix(9)), [0x4E, 7, 0x01, 0x00, 0x71, 0x00, 0x00, 1, 3])
+        XCTAssertEqual(data.suffix(4), Data("Hola".utf8))
+    }
+
+    func testTextPageIsClampedInsideTheCount() {
+        let data = EvenG1Protocol.textData(text: "x", page: 9, pageCount: 2)!
+        XCTAssertEqual(data[7], 1)
+        XCTAssertEqual(data[8], 2)
+        let zero = EvenG1Protocol.textData(text: "x", page: 0, pageCount: 0)!
+        XCTAssertEqual(Array(zero[7...8]), [0, 1], "a count of zero pages is one page")
+    }
+
+    func testEveryNonImagePacketStaysInsideTheLimit() {
+        let builders: [Data?] = [
+            EvenG1Protocol.textData(text: String(repeating: "a", count: 160)),
+            EvenG1Protocol.heartbeatData(),
+            EvenG1Protocol.brightnessData(brightness: 42, auto: false),
+            EvenG1Protocol.dashTimeWeatherData(weatherIcon: .sunny, temp: 25),
+            EvenG1Protocol.dashData(isShow: true, vertical: 4, distance: 3),
+            EvenG1Protocol.headTiltData(angle: 25),
+        ]
+        for data in builders.compactMap({ $0 }) {
+            XCTAssertLessThanOrEqual(data.count, 180)
+        }
+    }
+}

@@ -12,53 +12,76 @@ import Combine
 import UIKit
 #endif
 
+/// What the SDK tells its host. Every method has an empty default, so a host
+/// implements what it uses and nothing else.
+///
+/// Called on the main thread, always: the central manager is created on it and
+/// every callback the SDK makes is a consequence of one of its callbacks.
 public protocol EvenG1Delegate: AnyObject {
-    // Discovery / Selection
-    func didUpdateScanResults(_ results: [EvenG1SDK.Discovered],
-                              pairs: [EvenG1SDK.Pair])
-    func didRequirePairSelection(_ pairs: [EvenG1SDK.Pair])
-    
-    // Connection State
-    func didChangeConnectionState(_ state: EvenG1SDK.State)
-    func didFailToConnect(name: String?, id: UUID, error: Error?)
-    func didScanTimeout()
-    
-    // Reconnection / Loss
-    func didBeginReconnectAttempt(count: Int, for id: UUID)
-    func didLosePeripheral(name: String?, id: UUID)
-    
-    // Data / Events
-    func didReceiveTouchEvent(side: String, type: String)
-    func didReceiveMicAudio(data: Data)
-    func didReceiveNotification(id: Int, title: String, subtitle: String, message: String, from: String)
-    func didReceiveRawData(side: String, rawHex: String, decoded: String)
-    
-    // State
-    func didUpdateBattery(left: Int, right: Int, caseBattery: Int?)
-    func didUpdateGlassesState(_ state: EvenG1GlassesState)
+    // Discovery / selection
+    func glasses(_ sdk: EvenG1SDK, didUpdateScanResults results: [EvenG1SDK.Discovered],
+                 pairs: [EvenG1SDK.Pair])
+    func glasses(_ sdk: EvenG1SDK, didRequirePairSelection pairs: [EvenG1SDK.Pair])
+    func glassesDidScanTimeout(_ sdk: EvenG1SDK)
+
+    // Connection
+    func glasses(_ sdk: EvenG1SDK, didChangeState state: EvenG1SDK.State)
+    func glasses(_ sdk: EvenG1SDK, didFailToConnect side: G1Side?, name: String?, error: Error?)
+    func glasses(_ sdk: EvenG1SDK, didBeginReconnectAttempt count: Int, side: G1Side)
+    func glasses(_ sdk: EvenG1SDK, didLose side: G1Side)
+
+    // Events
+    func glasses(_ sdk: EvenG1SDK, didReceiveTouch gesture: G1Touch, from side: G1Side)
+    func glasses(_ sdk: EvenG1SDK, didReceiveMicAudio data: Data)
+    /// Every decoded inbound packet, after the SDK has applied it to its own
+    /// published state. For hosts that want the stream, not the summary.
+    func glasses(_ sdk: EvenG1SDK, didReceive event: G1Inbound, from side: G1Side)
 }
 
-// Optional delegate methods.
 public extension EvenG1Delegate {
-    func didUpdateBattery(left: Int, right: Int, caseBattery: Int?) {}
-    func didUpdateGlassesState(_ state: EvenG1GlassesState) {}
+    func glasses(_ sdk: EvenG1SDK, didUpdateScanResults results: [EvenG1SDK.Discovered],
+                 pairs: [EvenG1SDK.Pair]) {}
+    func glasses(_ sdk: EvenG1SDK, didRequirePairSelection pairs: [EvenG1SDK.Pair]) {}
+    func glassesDidScanTimeout(_ sdk: EvenG1SDK) {}
+    func glasses(_ sdk: EvenG1SDK, didChangeState state: EvenG1SDK.State) {}
+    func glasses(_ sdk: EvenG1SDK, didFailToConnect side: G1Side?, name: String?, error: Error?) {}
+    func glasses(_ sdk: EvenG1SDK, didBeginReconnectAttempt count: Int, side: G1Side) {}
+    func glasses(_ sdk: EvenG1SDK, didLose side: G1Side) {}
+    func glasses(_ sdk: EvenG1SDK, didReceiveTouch gesture: G1Touch, from side: G1Side) {}
+    func glasses(_ sdk: EvenG1SDK, didReceiveMicAudio data: Data) {}
+    func glasses(_ sdk: EvenG1SDK, didReceive event: G1Inbound, from side: G1Side) {}
 }
 
+/// The Even Realities G1, as one object.
+///
+/// The glasses are two BLE peripherals that share a channel name. This class
+/// pairs them, keeps both links alive, publishes what the hardware reports, and
+/// turns every command into the packets each arm expects. The rules of the
+/// wire — the left arm first and the right 100 ms later, a gap between writes
+/// to the same arm, nothing at all while an image is on the wire — live in
+/// each arm's `ArmOutbox`, where they can be tested without a radio.
+///
+/// Main thread only. The central manager is created with the main queue and
+/// every entry point expects to be called there.
 public final class EvenG1SDK: NSObject, ObservableObject {
     public static let shared = EvenG1SDK()
-    
+
     // MARK: - Public Types
+
     public enum State: Equatable {
         case idle
         case bluetoothOff
         case scanning
         case connecting
+        /// Which arms are linked **and writable**. An arm whose write
+        /// characteristic has not been discovered yet is not connected: what is
+        /// sent to it is dropped with no error.
         case connected(left: Bool, right: Bool)
         case error(G1Error)
     }
-    
+
     public enum SideHint: String { case left, right, unknown }
-    
+
     public struct Discovered: Identifiable, Equatable {
         public let id: UUID
         public let name: String
@@ -66,446 +89,369 @@ public final class EvenG1SDK: NSObject, ObservableObject {
         public let side: SideHint
         public let channel: String?
     }
-    
+
     public struct Pair: Identifiable, Equatable {
         public var id: String { channel ?? "unknown" }
         public let channel: String?
         public var left: Discovered?
         public var right: Discovered?
+
+        public var isComplete: Bool { left != nil && right != nil }
     }
-    
-    // MARK: - Public API observable
+
+    /// What an image transfer actually did, per arm. `nil` means the arm never
+    /// answered the checksum packet at all.
+    ///
+    /// The verdict is not inferred from chunk replies — this firmware does not
+    /// answer the data packets. It answers the end marker with `0x20 0xC9`, and
+    /// the CRC packet with the checksum it computed plus a status byte, `0xC9`
+    /// intact or `0xCA` not. That byte is the only truth available about a
+    /// display that cannot be seen from here.
+    public struct ImageTransferReport: Equatable, Sendable {
+        public let leftAccepted: Bool?
+        public let rightAccepted: Bool?
+
+        public init(leftAccepted: Bool?, rightAccepted: Bool?) {
+            self.leftAccepted = leftAccepted
+            self.rightAccepted = rightAccepted
+        }
+
+        public func accepted(by side: G1Side) -> Bool? {
+            side == .left ? leftAccepted : rightAccepted
+        }
+
+        /// At least one arm took the frame.
+        public var anyAccepted: Bool { leftAccepted == true || rightAccepted == true }
+    }
+
+    // MARK: - Published state
+
     @Published public private(set) var state: State = .idle
     @Published public private(set) var scanResults: [Discovered] = []
     @Published public private(set) var pairs: [String: Pair] = [:]
     @Published public private(set) var lastError: G1Error?
-    
-    // State tracking
-    @Published public var batteryInfo: EvenG1BatteryInfo = EvenG1BatteryInfo(left: 0, right: 0, caseBattery: nil)
-    @Published public var glassesState: EvenG1GlassesState = .unknown
-    @Published public var brightness: Float? = nil
+
+    @Published public private(set) var batteryInfo = EvenG1BatteryInfo(left: 0, right: 0, caseBattery: nil)
+    @Published public private(set) var glassesState: EvenG1GlassesState = .unknown
+    /// The level as the hardware has it, `0...42`; nil until it has answered.
+    @Published public private(set) var brightnessLevel: Int?
     /// Mirrors silent mode on the glasses: set by `setSilentMode(enabled:)` and
     /// updated when the wearer triple-taps the TouchBar.
-    @Published public var isSilentMode: Bool = false
-    @Published public var dashPosition: Int = 0
-    @Published public var wearDetectionEnabled: Bool = true
-    
-    // Device Info
-    @Published public var firmwareVersion: String = "Unknown"
-    @Published public var serialNumber: String = "Unknown"
-    @Published public var macAddress: String = "Unknown"
-    
+    @Published public private(set) var isSilentMode = false
+    @Published public private(set) var dashPosition: Int?
+    @Published public private(set) var wearDetectionEnabled: Bool?
+    @Published public private(set) var firmwareVersion: String?
+    @Published public private(set) var serialNumber: String?
+    @Published public private(set) var macAddress: String?
+    /// True while a frame is on the wire. Everything else waits.
+    @Published public private(set) var isTransferringImage = false
+
     public weak var delegate: EvenG1Delegate?
-    
-    // MARK: - BLE Internals
+
+    // MARK: - Wire rules
+
+    /// Minimum spacing between two writes to the same arm. Back-to-back writes
+    /// are dropped on the right side, and 100 ms is the gap the left→right
+    /// stagger has always used.
+    static let writeGap: TimeInterval = 0.1
+    /// The right arm gets each shared command this long after the left.
+    static let rightArmLag: TimeInterval = 0.1
+    /// A confirmed write should come back in milliseconds; the timeout is only
+    /// so a silent link cannot wedge a transfer.
+    static let writeTimeout: TimeInterval = 1.0
+    /// How long to wait for the arm's verdict on the CRC packet.
+    static let verdictTimeout: TimeInterval = 1.5
+    /// How many times to offer a frame to an arm that turns it down. The left
+    /// arm has been seen refusing the first frame after a connection and
+    /// taking the next.
+    static let transferAttempts = 2
+    /// Keepalive interval. Also the tick the other refreshes are counted in;
+    /// the glasses drop the link after about 32 s of silence.
+    static let upkeepInterval: TimeInterval = 8
+    /// Battery every twenty ticks; it does not move faster than that.
+    static let batteryEveryTicks = 20
+    static let reconnectAttempts = 3
+
+    // MARK: - Internals
+
     private var central: CBCentralManager!
+    private let left: ArmLink
+    private let right: ArmLink
     private var peripheralsById: [UUID: CBPeripheral] = [:]
     private var reconnectCount: [UUID: Int] = [:]
     private var scanTimer: DispatchSourceTimer?
-    
-    private var leftPeripheral: CBPeripheral?
-    private var rightPeripheral: CBPeripheral?
-    
-    // Characteristics
-    private var leftWriteChar: CBCharacteristic?
-    private var rightWriteChar: CBCharacteristic?
-    private var leftNotifyChar: CBCharacteristic?
-    private var rightNotifyChar: CBCharacteristic?
-    
-    // UUIDs
+    private var upkeepTimer: DispatchSourceTimer?
+    private var upkeepTicks = 0
+    /// Distinguishes consecutive text messages on the display.
+    private var textSeq: UInt8 = 0
+
     private let serviceUUID = CBUUID(string: "6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
     private let charWriteUUID = CBUUID(string: "6E400002-B5A3-F393-E0A9-E50E24DCCA9E")
     private let charNotifyUUID = CBUUID(string: "6E400003-B5A3-F393-E0A9-E50E24DCCA9E")
-    
+
     public override init() {
+        left = ArmLink(side: .left)
+        right = ArmLink(side: .right)
         super.init()
         central = CBCentralManager(delegate: self, queue: nil)
+        left.attachOutbox(Self.makeOutbox(for: left))
+        right.attachOutbox(Self.makeOutbox(for: right))
     }
-    
+
+    private static func makeOutbox(for arm: ArmLink) -> ArmOutbox {
+        ArmOutbox(
+            gap: writeGap,
+            now: { ProcessInfo.processInfo.systemUptime },
+            schedule: { delay, work in
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+            },
+            write: { [weak arm] data in arm?.writePlain(data) }
+        )
+    }
+
+    private func arm(for side: G1Side) -> ArmLink { side == .left ? left : right }
+
+    private func arm(for peripheral: CBPeripheral) -> ArmLink? {
+        if left.peripheral == peripheral { return left }
+        if right.peripheral == peripheral { return right }
+        return nil
+    }
+
     // MARK: - Scanning & Connection
-    
+
     public func startScan(timeout: TimeInterval = 15) {
         guard central.state == .poweredOn else {
             state = .bluetoothOff
             lastError = .bluetoothUnavailable
-            delegate?.didChangeConnectionState(state)
+            delegate?.glasses(self, didChangeState: state)
             return
         }
         state = .scanning
         scanResults.removeAll()
         pairs.removeAll()
         peripheralsById.removeAll()
-        
-        trace("Starting Scan...")
-        
-        // 1. Retrieve already connected peripherals (System level)
+
+        trace("Starting scan")
+
+        // Peripherals the system already holds a link to do not advertise.
         let connected = central.retrieveConnectedPeripherals(withServices: [serviceUUID])
         trace("Retrieved \(connected.count) connected peripherals")
         for p in connected {
-            trace("Found connected peripheral: \(p.name ?? "Unknown")")
-            // Manually trigger discovery handling
             centralManager(central, didDiscover: p, advertisementData: [:], rssi: 0)
         }
-        
-        // 2. Scan for advertising peripherals. Filtering by service UUID misses
-        // arms whose advertisement omits it, so match on the name instead.
+
+        // Filtering by service UUID misses arms whose advertisement omits it,
+        // so match on the name instead.
         central.scanForPeripherals(withServices: nil, options: nil)
-        
+
         scanTimer?.cancel()
-        scanTimer = DispatchSource.makeTimerSource()
-        scanTimer?.schedule(deadline: .now() + timeout)
-        scanTimer?.setEventHandler { [weak self] in
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                self.central.stopScan()
-                trace("Scan Timeout. Results: \(self.scanResults.count), Pairs: \(self.pairs.count)")
-                if self.isUsable {
-                    // Already talking to a pair; the timeout is just the scan
-                    // ending. Reporting "incomplete pair" here is what put
-                    // «lentes incompletos» on screen next to a live link.
-                    trace("Scan timeout while connected -- nothing to select")
-                } else if self.scanResults.isEmpty && self.pairs.isEmpty {
-                    self.state = .idle
-                    self.lastError = .scanTimeout
-                    self.delegate?.didScanTimeout()
-                    self.delegate?.didChangeConnectionState(self.state)
-                } else {
-                    self.delegate?.didRequirePairSelection(Array(self.pairs.values))
-                }
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + timeout)
+        timer.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            self.central.stopScan()
+            trace("Scan timeout. Results: \(self.scanResults.count), pairs: \(self.pairs.count)")
+            if self.isUsable {
+                // Already talking to a pair; the timeout is just the scan
+                // ending. Reporting an incomplete pair here is what put
+                // «lentes incompletos» on screen next to a live link.
+                trace("Scan timeout while connected: nothing to select")
+            } else if self.scanResults.isEmpty && self.pairs.isEmpty {
+                self.state = .idle
+                self.lastError = .scanTimeout
+                self.delegate?.glassesDidScanTimeout(self)
+                self.delegate?.glasses(self, didChangeState: self.state)
+            } else {
+                self.delegate?.glasses(self, didRequirePairSelection: Array(self.pairs.values))
             }
         }
-        scanTimer?.resume()
+        scanTimer = timer
+        timer.resume()
     }
-    
+
     public func stopScan() {
         central.stopScan()
         scanTimer?.cancel()
         scanTimer = nil
         if case .scanning = state { state = .idle }
     }
-    
+
     public func connect(pair: Pair) {
-        trace("connect(pair) called for channel: \(pair.channel ?? "nil")")
+        trace("connect(pair) for channel \(pair.channel ?? "nil")")
         connectBy(leftId: pair.left?.id, rightId: pair.right?.id)
     }
-    
+
+    /// Connects to the first complete pair seen, or to whatever arms there are.
     public func connect() {
-        trace("connect() called (Auto)")
-        // Prefer complete pair
-        if let complete = pairs.values.first(where: { $0.left != nil && $0.right != nil }) {
-            trace("Found complete pair: \(complete.channel ?? "unknown")")
-            connect(pair: complete); return
+        if let complete = pairs.values.first(where: { $0.isComplete }) {
+            trace("Connecting complete pair \(complete.channel ?? "unknown")")
+            connect(pair: complete)
+            return
         }
-        // Else first available L/R
-        let leftCand  = scanResults.first(where: { $0.side == .left })
+        let leftCand = scanResults.first(where: { $0.side == .left })
         let rightCand = scanResults.first(where: { $0.side == .right })
-        
-        trace("Candidates - Left: \(leftCand?.name ?? "nil"), Right: \(rightCand?.name ?? "nil")")
-        
         if leftCand != nil || rightCand != nil {
-            connectBy(leftId: leftCand?.id, rightId: rightCand?.id); return
+            connectBy(leftId: leftCand?.id, rightId: rightCand?.id)
+            return
         }
-        trace("No candidates found for auto-connect")
-        delegate?.didRequirePairSelection(Array(pairs.values))
+        trace("No candidates for auto-connect")
+        delegate?.glasses(self, didRequirePairSelection: Array(pairs.values))
     }
-    
+
     public func connectBy(leftId: UUID?, rightId: UUID?) {
         // Repeated scan results called this again while the first attempt was
-        // still in flight, so every connect, every restore and every frame
-        // happened twice.
-        if leftPeripheral?.state == .connected || leftPeripheral?.state == .connecting,
-           rightPeripheral?.state == .connected || rightPeripheral?.state == .connecting {
+        // still in flight, so every connect, restore and splash happened twice.
+        if left.isLinkedOrLinking && right.isLinkedOrLinking {
             trace("connectBy ignored: already connected or connecting")
             return
         }
-        trace("connectBy called. Left: \(String(describing: leftId)), Right: \(String(describing: rightId))")
         state = .connecting
-        if let l = leftId, let p = peripheralsById[l] {
-            trace("Connecting to Left Peripheral: \(p.name ?? "Unknown")")
-            leftPeripheral = p
+        for (id, arm) in [(leftId, left), (rightId, right)] {
+            guard let id = id, let p = peripheralsById[id] else {
+                trace("\(arm.side) peripheral id missing")
+                continue
+            }
+            trace("Connecting \(arm.side): \(p.name ?? "Unknown")")
+            arm.peripheral = p
             p.delegate = self
             central.connect(p, options: [CBConnectPeripheralOptionNotifyOnDisconnectionKey: true])
-        } else {
-            trace("Left Peripheral ID not found or nil")
         }
-        if let r = rightId, let p = peripheralsById[r] {
-            trace("Connecting to Right Peripheral: \(p.name ?? "Unknown")")
-            rightPeripheral = p
-            p.delegate = self
-            central.connect(p, options: [CBConnectPeripheralOptionNotifyOnDisconnectionKey: true])
-        } else {
-            trace("Right Peripheral ID not found or nil")
-        }
-        delegate?.didChangeConnectionState(state)
+        delegate?.glasses(self, didChangeState: state)
     }
-    
-    public func disconnect() {
-        if let l = leftPeripheral { central.cancelPeripheralConnection(l) }
-        if let r = rightPeripheral { central.cancelPeripheralConnection(r) }
-    }
-    
-    // MARK: - Commands
-    
-    /// Gap between consecutive chunks of an image transfer. Fifty-one chunks
-    /// make up one 576x136 frame, so this sets how long a frame takes to arrive.
-    /// Called when an arm reports whether the image it just received is intact.
-    private var imageVerdict: ((Bool) -> Void)?
-    /// Signalled when a confirmed write comes back from the peripheral.
-    private var writeConfirmation: ((Bool) -> Void)?
-    /// True while a frame is on the wire; nothing else may interleave with it.
-    private var isTransferringImage = false
-    /// Commands raised during a transfer, to be sent when it finishes.
-    private var heldWrites: [Data] = []
-    private var heldRightWrites: [Data] = []
-    /// Image transfers pace themselves; not on the caller's thread.
-    private let imageQueue = DispatchQueue(label: "network.rubio.eveng1.image")
-    private var upkeepTimer: DispatchSourceTimer?
-    private var upkeepTicks = 0
 
+    public func disconnect() {
+        for arm in [left, right] {
+            if let p = arm.peripheral { central.cancelPeripheralConnection(p) }
+        }
+    }
+
+    /// True once at least one arm can actually be written to.
+    private var isUsable: Bool { left.isWritable || right.isWritable }
+
+    // MARK: - Sending
+
+    /// Left first, right `rightArmLag` after the left write actually went out.
     private func sendToBoth(_ data: Data?) {
         guard let data = data else { return }
-        // An image is a byte stream to the arms: a command written into the
-        // middle of one becomes part of the image and fails its checksum.
-        if isTransferringImage {
-            trace("Held during image transfer: \(Self.hex(data))")
-            heldWrites.append(data)
-            return
-        }
         logCommand(data, prefix: "TX (Both)")
-        
-        // Send to Left
-        if let l = leftPeripheral, let c = leftWriteChar {
-            l.writeValue(data, for: c, type: .withoutResponse)
-        } else {
-            trace("Left Lens not ready (Peripheral: \(leftPeripheral != nil), Char: \(leftWriteChar != nil))")
-        }
-        
-        // The right arm needs the gap; back-to-back writes drop on its side.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-            guard let self = self else { return }
-            if let r = self.rightPeripheral, let c = self.rightWriteChar {
-                r.writeValue(data, for: c, type: .withoutResponse)
-            } else {
-                trace("Right Lens not ready (Peripheral: \(self.rightPeripheral != nil), Char: \(self.rightWriteChar != nil))")
+        if left.isWritable {
+            left.enqueue(data) { [weak self] in
+                guard let self = self else { return }
+                self.right.enqueue(data, delay: Self.rightArmLag)
             }
+        } else {
+            trace("Left arm not writable; right only")
+            right.enqueue(data, delay: Self.rightArmLag)
         }
-    }
-    
-    private func sendToRight(_ data: Data?) {
-        guard let data = data, let r = rightPeripheral, let c = rightWriteChar else { return }
-        // Same reason as sendToBoth: a command written into the middle of an
-        // image becomes part of it. Every state query the SDK makes comes
-        // through here, and they are aimed at the right arm — the one whose
-        // transfer runs second, and so the one they land in.
-        if isTransferringImage {
-            trace("Held during image transfer (right): \(Self.hex(data))")
-            heldRightWrites.append(data)
-            return
-        }
-        logCommand(data, prefix: "TX (Right)")
-        r.writeValue(data, for: c, type: .withoutResponse)
     }
 
-    static func hex(_ data: Data) -> String {
-        data.map { String(format: "%02X", $0) }.joined(separator: " ")
-    }
-    
-    private func sendData(_ data: Data, to peripheral: CBPeripheral) {
-        let char = (peripheral == leftPeripheral) ? leftWriteChar : rightWriteChar
-        guard let c = char else { return }
-        let side = (peripheral == leftPeripheral) ? "Left" : "Right"
+    private func send(_ data: Data?, to side: G1Side) {
+        guard let data = data else { return }
         logCommand(data, prefix: "TX (\(side))")
-        peripheral.writeValue(data, for: c, type: .withoutResponse)
+        arm(for: side).enqueue(data)
     }
-    
-    /// Sends a single page of text. Content longer than one screen is truncated
-    /// by the firmware; paginate upstream if the caller needs more.
-    public func sendText(_ text: String) {
-        sendToBoth(EvenG1Protocol.textData(text: text))
+
+    // MARK: - Text
+
+    /// Shows one page of text.
+    ///
+    /// The packet carries a single page and the firmware drops what does not
+    /// fit; the caller decides the page boundaries. `page` and `pageCount`
+    /// drive the pager the display draws.
+    public func sendText(_ text: String, page: Int = 0, pageCount: Int = 1) {
+        textSeq &+= 1
+        sendToBoth(EvenG1Protocol.textData(
+            text: text, seq: textSeq,
+            page: UInt8(clamping: page), pageCount: UInt8(clamping: max(pageCount, 1))))
     }
-    
+
+    // MARK: - Images
+
     #if canImport(UIKit)
     /// Converts the image to the 576x136 1-bit buffer the display expects.
-    public func sendImage(_ image: UIImage) {
+    public func sendImage(_ image: UIImage, completion: ((ImageTransferReport) -> Void)? = nil) {
         guard let raw = image.to1BitRaw(width: 576, height: 136) else { return }
-        sendImage(raw: raw)
+        sendImage(raw: raw, completion: completion)
     }
     #endif
-    
-    /// What a transfer actually did.
-    ///
-    /// The verdict is not something to be inferred from chunk replies: this
-    /// firmware does not answer the data packets at all. It answers the end
-    /// marker with `0x20 0xC9`, and the CRC packet with the checksum it
-    /// computed plus a status byte — `0xC9` if the image landed intact, `0xCA`
-    /// if it did not. That status is the only truth available about a display
-    /// that cannot be seen from here.
-    public struct ImageTransferReport: Sendable {
-        /// nil when the arm never answered at all.
-        public let leftAccepted: Bool?
-        public let rightAccepted: Bool?
 
-        public var summary: String {
-            "Izq. \(Self.word(leftAccepted)) · Der. \(Self.word(rightAccepted))"
-        }
-
-        private static func word(_ accepted: Bool?) -> String {
-            switch accepted {
-            case true?:  return "aceptada"
-            case false?: return "rechazada"
-            case nil:    return "sin respuesta"
-            }
+    /// Uploads a full-screen frame: every chunk, the end marker, then the CRC.
+    public func sendImage(raw: Data, completion: ((ImageTransferReport) -> Void)? = nil) {
+        Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            let report = await self.sendImage(raw: raw)
+            completion?(report)
         }
     }
 
-    /// Uploads a full-screen frame: every chunk, then the end marker, then the CRC.
+    /// Uploads a full-screen frame and returns each arm's verdict.
     ///
-    /// Nothing else may go out while this runs. The arms take the image as a
+    /// Nothing else goes out while this runs. The arms take the image as a
     /// byte stream and any other command written into the middle of it becomes
     /// part of the image: an 8-second keepalive landing inside a 3-second
     /// transfer is what made the left arm answer `0xCA` while the right, whose
-    /// turn came after the beat had passed, answered `0xC9`. Other writes are
-    /// held and sent afterwards.
+    /// turn came after the beat had passed, answered `0xC9`. Both outboxes are
+    /// paused for the duration and drain afterwards, in order.
+    ///
+    /// Image packets are written **with response**. An unresponded write is
+    /// fire and forget: Core Bluetooth drops it when its buffer is full and
+    /// says nothing, and the arms were receiving frames with holes in them.
     ///
     /// One arm at a time, because each keeps its own transfer state.
-    public func sendImage(
-        raw: Data, completion: ((ImageTransferReport) -> Void)? = nil
-    ) {
-        // Sized against what both arms will actually take. A write larger than
-        // the negotiated maximum is not truncated, it is dropped, and nothing
-        // says so — the image simply fails its checksum at the far end.
-        let room = [leftPeripheral, rightPeripheral]
-            .compactMap { $0?.maximumWriteValueLength(for: .withoutResponse) }
+    @MainActor
+    public func sendImage(raw: Data) async -> ImageTransferReport {
+        // Sized against what both arms will actually take. A write larger
+        // than the negotiated maximum is not truncated, it is dropped, and
+        // nothing says so — the image simply fails its checksum at the far end.
+        let room = [left, right]
+            .compactMap { $0.peripheral?.maximumWriteValueLength(for: .withoutResponse) }
             .min() ?? EvenG1Protocol.Bmp.maxLength + 6
-        let chunks = EvenG1Protocol.Bmp.data(image: raw, maxLength: max(16, min(
-            EvenG1Protocol.Bmp.maxLength, room - 6)))
+        let chunks = EvenG1Protocol.Bmp.data(
+            image: raw, maxLength: max(16, min(EvenG1Protocol.Bmp.maxLength, room - 6)))
         trace("Image: \(chunks.count) chunks, arms take \(room) bytes per write")
         let endMarker = EvenG1Protocol.Bmp.endData()
         let crcPacket = EvenG1Protocol.Bmp.crcData(
             crcValue: crc32xz(of: EvenG1Protocol.Bmp.calculateCrcInput(image: raw)))
 
-        imageQueue.async { [weak self] in
-            guard let self = self else { return }
-            DispatchQueue.main.sync { self.isTransferringImage = true }
+        isTransferringImage = true
+        left.pause()
+        right.pause()
+        defer {
+            isTransferringImage = false
+            left.resume()
+            right.resume()
+        }
 
-            var verdicts: [Side: Bool] = [:]
-            // Left first, as every other command goes. The order was tried both
-            // ways on hardware and made no difference — which arm rejects is a
-            // property of the arm, not of when its turn comes.
-            //
-            // And it is worth retrying: the left arm turns down the first frame
-            // after a connection and takes the next one, so the arms tell us
-            // when they are unhappy and there is no reason not to listen.
-            for side in [Side.left, Side.right] {
-                for attempt in 1...Self.transferAttempts {
-                    var lost = 0
-                    for chunk in chunks where !self.writeConfirmed(chunk, to: side) { lost += 1 }
-                    if lost > 0 { trace("\(side) lost \(lost) of \(chunks.count) chunks") }
-                    self.writeConfirmed(endMarker, to: side)
-                    let accepted = self.writeAwaitingVerdict(crcPacket, to: side)
-                    verdicts[side] = accepted
-                    if accepted == true { break }
-                    trace("\(side) rejected the frame on attempt \(attempt)")
+        var verdicts: [G1Side: Bool?] = [:]
+        // Left first, as every other command goes. The order was tried both
+        // ways on hardware and made no difference: which arm rejects is a
+        // property of the arm, not of when its turn comes.
+        for arm in [left, right] where arm.isWritable {
+            var verdict: Bool? = nil
+            for attempt in 1...Self.transferAttempts {
+                var lost = 0
+                for chunk in chunks where !(await arm.writeConfirmed(chunk, timeout: Self.writeTimeout)) {
+                    lost += 1
                 }
+                if lost > 0 { trace("\(arm.side) lost \(lost) of \(chunks.count) chunks") }
+                await arm.writeConfirmed(endMarker, timeout: Self.writeTimeout)
+                verdict = await arm.writeAwaitingVerdict(
+                    crcPacket, writeTimeout: Self.writeTimeout, verdictTimeout: Self.verdictTimeout)
+                if verdict == true { break }
+                trace("\(arm.side) rejected the frame on attempt \(attempt)")
             }
-
-            let report = ImageTransferReport(
-                leftAccepted: verdicts[.left], rightAccepted: verdicts[.right])
-            trace("Image transfer: \(report.summary)")
-
-            DispatchQueue.main.async {
-                self.isTransferringImage = false
-                self.flushHeldWrites()
-                completion?(report)
-            }
+            verdicts[arm.side] = verdict
         }
+
+        let report = ImageTransferReport(
+            leftAccepted: verdicts[.left] ?? nil, rightAccepted: verdicts[.right] ?? nil)
+        trace("Image transfer: left \(String(describing: report.leftAccepted)), "
+              + "right \(String(describing: report.rightAccepted))")
+        return report
     }
 
-    enum Side { case left, right }
-
-    /// A confirmed write should come back in milliseconds; this is only here
-    /// so a silent link cannot wedge the transfer.
-    private static let writeTimeout: TimeInterval = 1.0
-    /// How many times to offer a frame to an arm that turns it down.
-    private static let transferAttempts = 2
-    /// How long to wait for the arm's verdict on the CRC packet.
-    private static let verdictTimeout: TimeInterval = 1.5
-
-    /// Writes one image packet and waits for the peripheral to confirm it.
-    ///
-    /// `.withResponse`, not `.withoutResponse`. An unresponded write is fire
-    /// and forget: Core Bluetooth drops it when its buffer is full and says
-    /// nothing, and pacing the sends from another queue does not help, because
-    /// the writes themselves still run whenever the main queue gets to them —
-    /// which is all at once if it was busy. The arms were receiving a frame
-    /// with holes in it and rejecting it on the checksum, every time. A
-    /// confirmed write is delivered or it is an error.
-    @discardableResult
-    private func writeConfirmed(_ data: Data, to side: Side) -> Bool {
-        let semaphore = DispatchSemaphore(value: 0)
-        let delivered = Locked<Bool>(false)
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { semaphore.signal(); return }
-            let peripheral = side == .left ? self.leftPeripheral : self.rightPeripheral
-            guard let peripheral = peripheral,
-                  let characteristic = self.writeChar(for: peripheral) else {
-                semaphore.signal()
-                return
-            }
-            self.writeConfirmation = { ok in
-                delivered.value = ok
-                semaphore.signal()
-            }
-            peripheral.writeValue(data, for: characteristic, type: .withResponse)
-        }
-        _ = semaphore.wait(timeout: .now() + Self.writeTimeout)
-        DispatchQueue.main.async { [weak self] in self?.writeConfirmation = nil }
-        return delivered.value
-    }
-
-    /// Sends the CRC packet and waits for the arm to say whether the image
-    /// arrived intact. Returns nil if it never answers.
-    private func writeAwaitingVerdict(_ data: Data, to side: Side) -> Bool? {
-        let semaphore = DispatchSemaphore(value: 0)
-        let verdict = Locked<Bool?>(nil)
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { semaphore.signal(); return }
-            self.imageVerdict = { accepted in
-                verdict.value = accepted
-                semaphore.signal()
-            }
-            let peripheral = side == .left ? self.leftPeripheral : self.rightPeripheral
-            if let peripheral = peripheral, let char = self.writeChar(for: peripheral) {
-                peripheral.writeValue(data, for: char, type: .withResponse)
-            }
-        }
-        _ = semaphore.wait(timeout: .now() + Self.verdictTimeout)
-        DispatchQueue.main.async { [weak self] in self?.imageVerdict = nil }
-        return verdict.value
-    }
-
-    /// Commands raised while an image was in flight, sent once it is done.
-    private func flushHeldWrites() {
-        let both = heldWrites, right = heldRightWrites
-        heldWrites = []
-        heldRightWrites = []
-        var slot = 0
-        for data in both {
-            DispatchQueue.main.asyncAfter(deadline: .now() + Double(slot) * 0.12) {
-                self.sendToBoth(data)
-            }
-            slot += 1
-        }
-        for data in right {
-            DispatchQueue.main.asyncAfter(deadline: .now() + Double(slot) * 0.12) {
-                self.sendToRight(data)
-            }
-            slot += 1
-        }
-    }
-
-    private func writeChar(for peripheral: CBPeripheral) -> CBCharacteristic? {
-        peripheral == leftPeripheral ? leftWriteChar : rightWriteChar
+    public func hideImage() {
+        sendToBoth(EvenG1Protocol.Bmp.hideData())
     }
 
     // MARK: - Upkeep
@@ -513,11 +459,6 @@ public final class EvenG1SDK: NSObject, ObservableObject {
     // The glasses do not push their own state. Without this the battery reading
     // is whatever it was at connect: it was showing an hour-old figure, and a
     // flat 0 on the left, because the query only ever went to the right arm.
-
-    /// Keepalive interval. Also the tick the other refreshes are counted in.
-    private static let upkeepInterval: TimeInterval = 8
-    /// Battery every twenty ticks; it does not move faster than that.
-    private static let batteryEveryTicks = 20
 
     private func startUpkeep() {
         stopUpkeep()
@@ -535,6 +476,8 @@ public final class EvenG1SDK: NSObject, ObservableObject {
     }
 
     private func upkeepTick() {
+        // Queued like anything else, so a beat raised mid-transfer waits its
+        // turn instead of landing inside the frame.
         sendToBoth(EvenG1Protocol.heartbeatData())
         upkeepTicks &+= 1
         if upkeepTicks % Self.batteryEveryTicks == 0 { refreshBattery() }
@@ -546,11 +489,87 @@ public final class EvenG1SDK: NSObject, ObservableObject {
         sendToBoth(EvenG1Protocol.batteryData())
     }
 
+    /// Everything the arms know about themselves. The outbox paces the
+    /// queries; nothing here has to.
+    public func refreshState() {
+        send(EvenG1Protocol.getBrightnessData(), to: .right)
+        refreshBattery()
+        send(EvenG1Protocol.glassesStateData(), to: .right)
+        send(EvenG1Protocol.getWearDetectionData(), to: .right)
+        send(EvenG1Protocol.getDashPositionData(), to: .right)
+        send(EvenG1Protocol.getStatusData(), to: .right)
+        refreshDeviceInfo()
+    }
+
+    public func refreshDeviceInfo() {
+        send(EvenG1Protocol.firmwareData(), to: .right)
+        send(EvenG1Protocol.deviceSerialNumberData(), to: .right)
+        send(EvenG1Protocol.getMacAddressData(), to: .right)
+    }
+
+    // MARK: - Settings
+
+    public func setMicEnabled(_ enable: Bool) {
+        send(EvenG1Protocol.micData(enable: enable), to: .right)
+    }
+
+    public func setSilentMode(enabled: Bool) {
+        isSilentMode = enabled
+        sendToBoth(EvenG1Protocol.silentModeData(enabled: enabled))
+    }
+
+    public func setWearDetection(enabled: Bool) {
+        sendToBoth(EvenG1Protocol.wearDetectionData(enabled: enabled))
+    }
+
+    public func setBrightness(level: UInt8, auto: Bool) {
+        brightnessLevel = Int(min(level, 42))
+        sendToBoth(EvenG1Protocol.brightnessData(brightness: level, auto: auto))
+    }
+
+    public func setHeadTilt(angle: UInt8) {
+        sendToBoth(EvenG1Protocol.headTiltData(angle: angle))
+    }
+
+    public func setHeadsUpMode(_ config: EvenG1Protocol.HeadsUpConfig) {
+        sendToBoth(EvenG1Protocol.headsUpConfig(config))
+    }
+
+    public func setLanguage(_ language: EvenG1Protocol.Language) {
+        sendToBoth(EvenG1Protocol.languageSetData(language))
+    }
+
+    public func startHeadUpCalibration() {
+        sendToBoth(EvenG1Protocol.headUpCalibrationData(action: .start))
+    }
+
+    public func confirmHeadUpCalibration() {
+        sendToBoth(EvenG1Protocol.headUpCalibrationData(action: .confirm))
+    }
+
+    public func exitHeadUpCalibration() {
+        sendToBoth(EvenG1Protocol.headUpCalibrationData(action: .exit))
+    }
+
+    // MARK: - Dashboard
+
+    public func sendDashboard(mode: EvenG1Protocol.DashMode, subMode: EvenG1Protocol.DashSubMode) {
+        sendToBoth(EvenG1Protocol.dashModeData(mode: mode, subMode: subMode))
+    }
+
+    public func sendDashboardConfig(isShow: Bool, vertical: UInt8, distance: UInt8) {
+        sendToBoth(EvenG1Protocol.dashData(isShow: isShow, vertical: vertical, distance: distance))
+    }
+
+    public func sendWeather(temperature: Int, icon: EvenG1Protocol.WeatherIcon, isCelsius: Bool) {
+        sendToBoth(EvenG1Protocol.weatherData(temperature: temperature, icon: icon, isCelsius: isCelsius))
+    }
+
     /// Sets the glasses' clock, and the weather beside it.
     ///
     /// The dashboard has no clock of its own: unless the phone tells it the
-    /// time it will keep showing the start of its own epoch, which is what
-    /// "monday 01-01, 01:00 am" is.
+    /// time it keeps showing the start of its own epoch, which is what
+    /// «monday 01-01, 01:00 am» is.
     public func syncTimeAndWeather(
         icon: EvenG1Protocol.WeatherIcon = .none,
         temperature: Int8 = 0,
@@ -562,525 +581,271 @@ public final class EvenG1SDK: NSObject, ObservableObject {
             isFahrenheit: isFahrenheit, is12Hour: is12Hour))
     }
 
-    public func refreshState() {
-        // Staggered so the glasses are not flooded with back-to-back queries.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            self.sendToRight(EvenG1Protocol.getBrightnessData())
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
-            // Both: each arm reports only its own charge.
-            self.sendToBoth(EvenG1Protocol.batteryData())
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) {
-            self.sendToRight(EvenG1Protocol.glassesStateData())
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.1) {
-            self.sendToRight(EvenG1Protocol.getWearDetectionData())
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.3) {
-            self.sendToRight(EvenG1Protocol.getDashPositionData())
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-            self.sendToRight(EvenG1Protocol.getStatusData())
-        }
-        
-        // Refresh Device Info
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-            self.refreshDeviceInfo()
-        }
-    }
-    
-    public func refreshDeviceInfo() {
-        sendToRight(EvenG1Protocol.firmwareData())
-        
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            self.sendToRight(EvenG1Protocol.deviceSerialNumberData())
-        }
-        
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-            self.sendToRight(EvenG1Protocol.getMacAddressData())
-        }
-    }
-    
-    public func hideImage() {
-        sendToBoth(EvenG1Protocol.Bmp.hideData())
-    }
-    
-    public func setMicEnabled(_ enable: Bool) {
-        sendToRight(EvenG1Protocol.micData(enable: enable))
-    }
-    
-    public func sendSilentMode(enabled: Bool) {
-        sendToBoth(EvenG1Protocol.silentModeData(enabled: enabled))
-    }
-    
-    public func setSilentMode(enabled: Bool) {
-        sendToBoth(EvenG1Protocol.silentModeData(enabled: enabled))
-    }
-    
-    public func setWearDetection(enabled: Bool) {
-        sendToBoth(EvenG1Protocol.wearDetectionData(enabled: enabled))
-    }
-    
-    public func setBrightness(level: UInt8, auto: Bool) {
-        // Optimistic update
-        let maxLevel: Float = 42.0
-        let normalized = min(max(Float(level) / maxLevel, 0.0), 1.0)
-        self.brightness = normalized
-        
-        sendToBoth(EvenG1Protocol.brightnessData(brightness: level, auto: auto))
-    }
-    
-    public func sendDashboard(mode: EvenG1Protocol.DashMode, subMode: EvenG1Protocol.DashSubMode) {
-        sendToBoth(EvenG1Protocol.dashModeData(mode: mode, subMode: subMode))
-    }
-    
-    public func sendDashboardConfig(isShow: Bool, vertical: UInt8, distance: UInt8) {
-        sendToBoth(EvenG1Protocol.dashData(isShow: isShow, vertical: vertical, distance: distance))
-    }
-    
-    public func sendWeather(temperature: Int, icon: EvenG1Protocol.WeatherIcon, isCelsius: Bool) {
-        sendToBoth(EvenG1Protocol.weatherData(temperature: temperature, icon: icon, isCelsius: isCelsius))
-    }
-    
-    public func sendNotification(_ notification: EvenG1Notification) {
-        // Convert public model to internal payload
+    // MARK: - Notifications
+
+    /// Shows a notification. Chunked JSON to the left arm, paced by its outbox
+    /// — the caller's thread is never slept on.
+    public func sendNotification(_ notification: EvenG1Notification, id: Int? = nil) {
+        let now = Date()
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
         let payload = NotificationPayload(
             ncs_notification: NotificationPayload.NCSNotification(
-                msg_id: Int(Date().timeIntervalSince1970), // Simple ID generation
-                type: 1, // Unknown type, maybe 1 is standard?
+                msg_id: id ?? Int(now.timeIntervalSince1970),
+                type: 1,
                 app_identifier: notification.appName,
                 title: notification.title,
                 subtitle: notification.subtitle,
                 message: notification.message,
-                time_s: Int(Date().timeIntervalSince1970),
-                date: Date().formatted(), // Needs specific format? Wiki example: "2025-06-10 18:43:37"
+                time_s: Int(now.timeIntervalSince1970),
+                date: formatter.string(from: now),
                 display_name: notification.appName
             ),
             type: "ncs_notification"
         )
-        
-        if let chunks = EvenG1Protocol.notificationData(payload) {
-            for chunk in chunks {
-                // Notifications go to the left arm only.
-                if let left = leftPeripheral {
-                    sendData(chunk, to: left)
-                    // The glasses acknowledge each chunk with 0xC9; pacing the
-                    // writes stands in for waiting on that response.
-                    Thread.sleep(forTimeInterval: 0.05)
-                }
-            }
-        }
+        guard let chunks = EvenG1Protocol.notificationData(payload) else { return }
+        for chunk in chunks { send(chunk, to: .left) }
     }
-    
+
     public func clearNotification(id: Int) {
-        if let left = leftPeripheral {
-            sendData(EvenG1Protocol.notificationClearData(msgId: id), to: left)
-        }
+        send(EvenG1Protocol.notificationClearData(msgId: id), to: .left)
     }
-    
+
+    // MARK: - Teleprompter & notes
+
     public func sendTeleprompter(visible: String, next: String, progress: UInt8, isFirst: Bool) {
-        guard let packets = EvenG1Protocol.Teleprompter.data(isFirst: isFirst, visibleText: visible, nextText: next, completedPercent: progress) else { return }
-        for packet in packets {
-            sendToBoth(packet)
-        }
+        guard let packets = EvenG1Protocol.Teleprompter.data(
+            isFirst: isFirst, visibleText: visible, nextText: next, completedPercent: progress)
+        else { return }
+        packets.forEach(sendToBoth)
     }
-    
+
     public func exitTeleprompter() {
         sendToBoth(EvenG1Protocol.Teleprompter.endData())
     }
-    
+
+    public func sendQuickNote(title: String, content: String) {
+        EvenG1Protocol.quickNoteData(title: title, content: content).forEach(sendToBoth)
+    }
+
+    public func sendNotes(_ notes: [EvenG1Protocol.Note]) {
+        EvenG1Protocol.notesData(notes: notes).forEach(sendToBoth)
+    }
+
     // MARK: - System & Admin
-    
+
     public func reboot() {
         sendToBoth(EvenG1Protocol.rebootData())
     }
-    
+
     public func factoryReset() {
         sendToBoth(EvenG1Protocol.factoryResetData())
     }
-    
+
     public func setDebugLogging(enabled: Bool) {
         sendToBoth(EvenG1Protocol.debugLoggingData(enabled: enabled))
     }
-    
+
     public func getMacAddress() {
-        sendToRight(EvenG1Protocol.getMacAddressData())
+        send(EvenG1Protocol.getMacAddressData(), to: .right)
     }
-    
-    public func setLanguage(_ language: EvenG1Protocol.Language) {
-        sendToBoth(EvenG1Protocol.languageSetData(language))
-    }
-    
-    public func startHeadUpCalibration() {
-        sendToBoth(EvenG1Protocol.headUpCalibrationData(action: .start))
-    }
-    
-    public func confirmHeadUpCalibration() {
-        sendToBoth(EvenG1Protocol.headUpCalibrationData(action: .confirm))
-    }
-    
-    public func exitHeadUpCalibration() {
-        sendToBoth(EvenG1Protocol.headUpCalibrationData(action: .exit))
-    }
-    
-    public func setHeadsUpMode(_ config: EvenG1Protocol.HeadsUpConfig) {
-        sendToBoth(EvenG1Protocol.headsUpConfig(config))
-    }
-    
-    public func setHeadTilt(angle: UInt8) {
-        guard let data = EvenG1Protocol.headTiltData(angle: angle) else { return }
-        sendToBoth(data)
-    }
-    
-    public func sendQuickNote(title: String, content: String) {
-        let packets = EvenG1Protocol.quickNoteData(title: title, content: content)
-        for packet in packets {
-            sendToBoth(packet)
-        }
-    }
-    
-    public func sendNotes(_ notes: [EvenG1Protocol.Note]) {
-        let packets = EvenG1Protocol.notesData(notes: notes)
-        for packet in packets {
-            sendToBoth(packet)
-        }
-    }
-    
-    // MARK: - Incoming Data Handling
-    
-    private func handleIncomingData(_ data: Data, side: String) {
-        logCommand(data, prefix: "RX (\(side))")
-        let hex = data.map { String(format: "%02X", $0) }.joined(separator: " ")
-        // Decoded form is for the log stream; parsing below drives state.
-        var decoded = "Unknown"
-        
+
+    // MARK: - Inbound
+
+    private func handleIncoming(_ data: Data, from arm: ArmLink) {
         guard !data.isEmpty else { return }
-        let cmdByte = data[0]
-        
-        if let cmd = EvenG1Cmd(rawValue: cmdByte) {
-            switch cmd {
-            case .device: // 0xF5
-                if data.count >= 2 {
-                    let sub = data[1]
-                    switch sub {
-                    case 0x01: decoded = "Single Tap"
-                    case 0x00: decoded = "Double Tap"
-                    // Triple tap toggles silent mode on the glasses themselves, so
-                    // the published flag has to follow the hardware, not just our
-                    // own writes. Which of the two codes means "on" is inferred from
-                    // the reference tables and has not been confirmed on a device.
-                    case 0x04, 0x05:
-                        let silent = sub == 0x04
-                        decoded = "Triple Tap (silent \(silent ? "on" : "off"))"
-                        DispatchQueue.main.async { self.isSilentMode = silent }
-                    // 0x17 fires while the bar is held (Even AI starts capturing),
-                    // 0x18 when it is released.
-                    case 0x17: decoded = "Long Press Start"
-                    case 0x18: decoded = "Long Press End"
-                    case 0x16, 0x15: decoded = "Long Press End"
-                    default: decoded = "Touch Event 0x\(String(format: "%02X", sub))"
-                    }
-                    delegate?.didReceiveTouchEvent(side: side, type: decoded)
-                }
-            case .micData: // 0xF1
-                if data.count > 2 {
-                    decoded = "Mic Audio"
-                    delegate?.didReceiveMicAudio(data: data.subdata(in: 2..<data.count))
-                }
-            case .battery: // 0x2C
-                // Parse battery
-                // Left: 0x2c 66 4b ...
-                // Right: 0x2c 66 4d ...
-                if data.count > 2 {
-                    let val = Int(data[2])
-                    decoded = "Battery: \(val)%"
-                    var current = batteryInfo
-                    if side == "LEFT" {
-                        current = EvenG1BatteryInfo(left: val, right: current.right, caseBattery: current.caseBattery)
-                    } else {
-                        current = EvenG1BatteryInfo(left: current.left, right: val, caseBattery: current.caseBattery)
-                    }
-                    batteryInfo = current
-                    delegate?.didUpdateBattery(left: batteryInfo.left, right: batteryInfo.right, caseBattery: batteryInfo.caseBattery)
-                }
-            case .glassesState: // 0x2B
-                if data.count >= 4 {
-                    let stateByte = data[3]
-                    var newState: EvenG1GlassesState = .unknown
-                    switch stateByte {
-                    case 0x06: newState = .wearing
-                    case 0x07: newState = .off
-                    case 0x08: newState = .caseOpen
-                    case 0x0B: newState = .caseClosed
-                    default: break
-                    }
-                    decoded = "Glasses State: \(newState)"
-                    if newState != .unknown {
-                        glassesState = newState
-                        delegate?.didUpdateGlassesState(newState)
-                    }
-                }
-            case .brightnessState: // 0x29
-                // Observed on firmware 1.6.6: 29 65 2A, where 0x2A is the level
-                // that was just set and 0x65 is not it. Reading data[1] as the
-                // level reported 101 out of 42 and pinned the readback at full.
-                if data.count >= 3 {
-                    let level = Float(data[2])
-                    let maxLevel: Float = 42.0
-                    let normalized = min(max(level / maxLevel, 0.0), 1.0)
-                    DispatchQueue.main.async {
-                        self.brightness = normalized
-                    }
-                    decoded = "Brightness: \(Int(level))"
-                }
-            case .wearDetectionGet: // 0x3A
-                if data.count >= 2 {
-                    let enabled = data[1] == 0x01
-                    DispatchQueue.main.async {
-                        self.wearDetectionEnabled = enabled
-                    }
-                    decoded = "Wear Detection: \(enabled)"
-                }
-            case .dashPosition: // 0x3B
-                if data.count >= 2 {
-                    let pos = Int(data[1])
-                    DispatchQueue.main.async {
-                        self.dashPosition = pos
-                    }
-                    decoded = "Dash Position: \(pos)"
-                }
-            case .statusGet: // 0x22
-                decoded = "Status: \(hex)"
-            case .bmpShow: // 0x16 — the arm's verdict on the image just sent
-                // 16 [crc32 big-endian] [status], where 0xC9 means the image
-                // arrived intact and 0xCA means it did not.
-                let accepted = data.count >= 6 && data[5] == 0xC9
-                decoded = accepted ? "Image accepted" : "Image rejected: \(hex)"
-                imageVerdict?(accepted)
-                imageVerdict = nil
-            case .notification: // 0x4B
-                decoded = "Notification RX"
-            case .firmwareInfoRes: // 0x6E
-                if data.count > 1 {
-                    let versionData = data.subdata(in: 1..<data.count)
-                    if let versionStr = String(data: versionData, encoding: .utf8) {
-                        decoded = "Firmware: \(versionStr)"
-                        DispatchQueue.main.async {
-                            self.firmwareVersion = versionStr
-                        }
-                    }
-                }
-            case .deviceSerialNumber: // 0x34
-                if data.count > 1 {
-                    let snData = data.subdata(in: 1..<data.count)
-                    if let snStr = String(data: snData, encoding: .utf8) {
-                        decoded = "Serial: \(snStr)"
-                        DispatchQueue.main.async {
-                            self.serialNumber = snStr
-                        }
-                    }
-                }
-            case .macAddress: // 0x2D
-                if data.count > 1 {
-                    let macData = data.subdata(in: 1..<data.count)
-                    // MAC is likely a string or bytes. Try string first.
-                    if let macStr = String(data: macData, encoding: .utf8), macStr.contains(":") {
-                         decoded = "MAC: \(macStr)"
-                         DispatchQueue.main.async {
-                             self.macAddress = macStr
-                         }
-                    } else {
-                        // Fallback to hex bytes
-                        let macHex = macData.map { String(format: "%02X", $0) }.joined(separator: ":")
-                        decoded = "MAC: \(macHex)"
-                        DispatchQueue.main.async {
-                            self.macAddress = macHex
-                        }
-                    }
-                }
-            default:
-                decoded = "Cmd \(cmd)"
-            }
+        let event = G1Inbound.decode(data)
+        trace("RX (\(arm.side)) [\(Self.commandName(data[0]))] \(Self.hex(data)) → \(event.traceDescription)")
+        apply(event, from: arm)
+        switch event {
+        case .touch(let gesture): delegate?.glasses(self, didReceiveTouch: gesture, from: arm.side)
+        case .micAudio(let audio): delegate?.glasses(self, didReceiveMicAudio: audio)
+        default: break
         }
-        
-        delegate?.didReceiveRawData(side: side, rawHex: hex, decoded: decoded)
+        delegate?.glasses(self, didReceive: event, from: arm.side)
+    }
+
+    /// Folds one event into the published state.
+    private func apply(_ event: G1Inbound, from arm: ArmLink) {
+        switch event {
+        case .battery(let percent):
+            batteryInfo = arm.side == .left
+                ? EvenG1BatteryInfo(left: percent, right: batteryInfo.right, caseBattery: batteryInfo.caseBattery)
+                : EvenG1BatteryInfo(left: batteryInfo.left, right: percent, caseBattery: batteryInfo.caseBattery)
+        case .glassesState(let state):
+            glassesState = state
+        case .brightness(let level):
+            brightnessLevel = level
+        case .wearDetection(let enabled):
+            wearDetectionEnabled = enabled
+        case .dashPosition(let position):
+            dashPosition = position
+        case .touch(.tripleTap(let silent)):
+            isSilentMode = silent
+        case .imageVerdict(let accepted, _):
+            arm.resolveVerdict(accepted)
+        case .firmware(let version):
+            firmwareVersion = version
+        case .serial(let serial):
+            serialNumber = serial
+        case .macAddress(let mac):
+            macAddress = mac
+        case .touch, .imageEnd, .micAudio, .status, .unknown:
+            break
+        }
+    }
+
+    // MARK: - Trace helpers
+
+    static func hex(_ data: Data) -> String {
+        data.map { String(format: "%02X", $0) }.joined(separator: " ")
+    }
+
+    static func commandName(_ opcode: UInt8) -> String {
+        EvenG1Cmd(rawValue: opcode).map { "\($0)" } ?? "Unknown (0x\(String(format: "%02X", opcode)))"
+    }
+
+    private func logCommand(_ data: Data, prefix: String) {
+        guard let opcode = data.first else { return }
+        trace("\(prefix) [\(Self.commandName(opcode))] \(Self.hex(data))")
     }
 }
 
-// MARK: - CBCentralManagerDelegate
+// MARK: - CBCentralManagerDelegate / CBPeripheralDelegate
+
 extension EvenG1SDK: CBCentralManagerDelegate, CBPeripheralDelegate {
     public func centralManagerDidUpdateState(_ central: CBCentralManager) {
         if central.state != .poweredOn {
             state = .bluetoothOff
             lastError = .bluetoothUnavailable
-            delegate?.didChangeConnectionState(state)
+            delegate?.glasses(self, didChangeState: state)
         }
     }
-    
-    public func centralManager(_ central: CBCentralManager, didDiscover p: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) {
+
+    public func centralManager(
+        _ central: CBCentralManager, didDiscover p: CBPeripheral,
+        advertisementData: [String: Any], rssi RSSI: NSNumber
+    ) {
         peripheralsById[p.identifier] = p
         let name = p.name ?? "Unknown"
         let (side, channel) = parseName(name)
-        trace("Discovered \(name) -> Side: \(side), Channel: \(channel ?? "nil")")
+        trace("Discovered \(name) -> side \(side), channel \(channel ?? "nil")")
         let d = Discovered(id: p.identifier, name: name, rssi: RSSI.intValue, side: side, channel: channel)
-        
+
         if let idx = scanResults.firstIndex(where: { $0.id == d.id }) {
             scanResults[idx] = d
         } else {
             scanResults.append(d)
         }
-        
+
         if let ch = channel {
             var pair = pairs[ch] ?? Pair(channel: ch, left: nil, right: nil)
             switch side {
-            case .left:  pair.left  = d
+            case .left: pair.left = d
             case .right: pair.right = d
             case .unknown: break
             }
             pairs[ch] = pair
         }
-        
-        delegate?.didUpdateScanResults(scanResults, pairs: Array(pairs.values))
+
+        delegate?.glasses(self, didUpdateScanResults: scanResults, pairs: Array(pairs.values))
     }
-    
+
     public func centralManager(_ central: CBCentralManager, didConnect p: CBPeripheral) {
         trace("Connected to \(p.name ?? "Unknown")")
         p.delegate = self
         p.discoverServices([serviceUUID])
         checkConnectionState()
     }
-    
+
     public func centralManager(_ central: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) {
-        trace("Failed to connect to \(p.name ?? "Unknown"): \(error?.localizedDescription ?? "No error")")
-        lastError = .connectionFailed(name: p.name, id: p.identifier, underlying: error)
-        delegate?.didFailToConnect(name: p.name, id: p.identifier, error: error)
-        state = .error(lastError!)
-        delegate?.didChangeConnectionState(state)
+        trace("Failed to connect to \(p.name ?? "Unknown"): \(error?.localizedDescription ?? "no error")")
+        let failure = G1Error.connectionFailed(name: p.name, id: p.identifier, underlying: error)
+        lastError = failure
+        delegate?.glasses(self, didFailToConnect: arm(for: p)?.side, name: p.name, error: error)
+        state = .error(failure)
+        delegate?.glasses(self, didChangeState: state)
     }
-    
+
     public func centralManager(_ central: CBCentralManager, didDisconnectPeripheral p: CBPeripheral, error: Error?) {
         trace("Disconnected from \(p.name ?? "Unknown")")
-        delegate?.didLosePeripheral(name: p.name, id: p.identifier)
-        
-        if p == leftPeripheral { leftPeripheral = nil; leftWriteChar = nil; leftNotifyChar = nil }
-        if p == rightPeripheral { rightPeripheral = nil; rightWriteChar = nil; rightNotifyChar = nil }
-        
-        // Simple reconnect logic
-        let c = (reconnectCount[p.identifier] ?? 0) + 1
-        reconnectCount[p.identifier] = c
-        if c <= 3 {
-            delegate?.didBeginReconnectAttempt(count: c, for: p.identifier)
+        guard let arm = arm(for: p) else { return }
+        delegate?.glasses(self, didLose: arm.side)
+        arm.linkDropped()
+
+        let attempt = (reconnectCount[p.identifier] ?? 0) + 1
+        reconnectCount[p.identifier] = attempt
+        if attempt <= Self.reconnectAttempts {
+            delegate?.glasses(self, didBeginReconnectAttempt: attempt, side: arm.side)
+            arm.peripheral = p
             central.connect(p, options: [CBConnectPeripheralOptionNotifyOnDisconnectionKey: true])
         } else {
             checkConnectionState()
         }
     }
-    
+
     private func checkConnectionState() {
-        let leftLinked = (leftPeripheral?.state == .connected)
-        let rightLinked = (rightPeripheral?.state == .connected)
         // A link you cannot write to is not a connection. `didConnect` fires
         // before service discovery, so an arm reports itself connected while
         // its write characteristic is still nil and everything sent to it is
-        // dropped on the floor -- which is why a splash sent the moment the
+        // dropped on the floor — which is why a splash sent the moment the
         // glasses "connected" only ever reached the arm that happened to
         // finish discovering first.
-        let leftOk = leftLinked && leftWriteChar != nil
-        let rightOk = rightLinked && rightWriteChar != nil
-        trace("Connection State Check - Left: \(leftOk) (linked \(leftLinked)), "
-              + "Right: \(rightOk) (linked \(rightLinked))")
+        let leftLinked = left.isLinked, rightLinked = right.isLinked
+        let leftOk = left.isWritable, rightOk = right.isWritable
+        trace("Connection state: left \(leftOk) (linked \(leftLinked)), right \(rightOk) (linked \(rightLinked))")
 
         if !leftLinked && !rightLinked {
             state = .idle
             stopUpkeep()
-            imageVerdict = nil
-            isTransferringImage = false
-            heldWrites = []
-            heldRightWrites = []
         } else if !leftOk && !rightOk {
             state = .connecting
         } else {
             state = .connected(left: leftOk, right: rightOk)
             if leftOk && rightOk { startUpkeep() }
         }
-        delegate?.didChangeConnectionState(state)
+        delegate?.glasses(self, didChangeState: state)
     }
 
-    /// True once at least one arm can actually be written to.
-    private var isUsable: Bool { leftWriteChar != nil || rightWriteChar != nil }
-    
-    public func peripheral(
-        _ p: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?
-    ) {
-        if let error = error { trace("Write failed: \(error.localizedDescription)") }
-        writeConfirmation?(error == nil)
-        writeConfirmation = nil
+    public func peripheral(_ p: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
+        if let error = error { trace("Write failed on \(arm(for: p)?.side.description ?? "?"): \(error.localizedDescription)") }
+        arm(for: p)?.resolveWrite(error == nil)
     }
 
     public func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) {
-        trace("Discovered Services for \(p.name ?? "Unknown")")
+        trace("Discovered services for \(p.name ?? "Unknown")")
         p.services?.forEach { p.discoverCharacteristics([charWriteUUID, charNotifyUUID], for: $0) }
     }
-    
+
     public func peripheral(_ p: CBPeripheral, didDiscoverCharacteristicsFor s: CBService, error: Error?) {
-        trace("Discovered Characteristics for \(p.name ?? "Unknown")")
+        guard let arm = arm(for: p) else { return }
+        trace("Discovered characteristics for \(arm.side)")
         s.characteristics?.forEach { ch in
             if ch.uuid == charWriteUUID {
-                if p == leftPeripheral {
-                    trace("Found Left Write Char")
-                    leftWriteChar = ch
-                }
-                if p == rightPeripheral {
-                    trace("Found Right Write Char")
-                    rightWriteChar = ch
-                }
+                arm.writeChar = ch
             } else if ch.uuid == charNotifyUUID {
                 p.setNotifyValue(true, for: ch)
-                if p == leftPeripheral {
-                    trace("Found Left Notify Char")
-                    leftNotifyChar = ch
-                }
-                if p == rightPeripheral {
-                    trace("Found Right Notify Char")
-                    rightNotifyChar = ch
-                }
+                arm.notifyChar = ch
             }
         }
-        if writeChar(for: p) != nil {
-            trace("\(p == leftPeripheral ? "Left" : "Right") max write "
-                  + "\(p.maximumWriteValueLength(for: .withoutResponse)) bytes "
+        if arm.isWritable {
+            trace("\(arm.side) max write \(p.maximumWriteValueLength(for: .withoutResponse)) bytes "
                   + "(withResponse \(p.maximumWriteValueLength(for: .withResponse)))")
         }
         // The arm only becomes usable here, so this is where "connected" can
         // honestly be reported.
         checkConnectionState()
     }
-    
+
     public func peripheral(_ p: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
-        guard let data = characteristic.value else { return }
-        let side = (p == leftPeripheral) ? "LEFT" : "RIGHT"
-        handleIncomingData(data, side: side)
-    }
-
-
-    // MARK: - Logging Helper
-    
-    private func logCommand(_ data: Data, prefix: String) {
-        guard !data.isEmpty else { return }
-        let cmdByte = data[0]
-        let hex = data.map { String(format: "%02X", $0) }.joined(separator: " ")
-        
-        var cmdName = "Unknown (0x\(String(format: "%02X", cmdByte)))"
-        if let cmd = EvenG1Cmd(rawValue: cmdByte) {
-            cmdName = "\(cmd)"
-        }
-        
-        trace("\(prefix) [\(cmdName)] Data: \(hex)")
+        guard let data = characteristic.value, let arm = arm(for: p) else { return }
+        handleIncoming(data, from: arm)
     }
 }
 
 // MARK: - Helpers
+
 extension EvenG1SDK {
     internal func parseName(_ name: String) -> (SideHint, String?) {
         let comps = name.split(separator: "_")
@@ -1111,18 +876,4 @@ func trace(_ message: @autoclosure () -> String) {
     guard EvenG1SDK.isTracingEnabled else { return }
     let line = "[EvenG1Kit] \(message())"
     if let sink = EvenG1SDK.traceSink { sink(line) } else { fputs(line + "\n", stderr) }
-}
-
-
-/// One value, guarded, so a result can cross the queue the semaphore separates.
-final class Locked<Value>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var stored: Value
-
-    init(_ value: Value) { stored = value }
-
-    var value: Value {
-        get { lock.lock(); defer { lock.unlock() }; return stored }
-        set { lock.lock(); stored = newValue; lock.unlock() }
-    }
 }
